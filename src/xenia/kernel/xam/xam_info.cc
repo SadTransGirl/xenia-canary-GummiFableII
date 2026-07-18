@@ -57,8 +57,14 @@ namespace xam {
 // https://github.com/tpn/winsdk-10/blob/master/Include/10.0.14393.0/km/wdm.h#L15539
 typedef enum _MODE { KernelMode, UserMode, MaximumMode } MODE;
 
-dword_result_t XamFeatureEnabled_entry(dword_t app_id) { return 0; }
-DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kStub);
+dword_result_t XamFeatureEnabled_entry(qword_t feature_bit) {
+  const std::bitset<36> feature(0x40ffffffff);
+  if (feature.test(feature_bit)) {
+    return 1;
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kImplemented);
 
 dword_result_t XamGetStagingMode_entry() { return cvars::staging_mode; }
 DECLARE_XAM_EXPORT1(XamGetStagingMode, kNone, kStub);
@@ -336,6 +342,32 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
 
 void XamLoaderTerminateTitle_entry() {
+  std::string title = "Title terminated";
+  std::string message = "Game requested exit to dashboard.";
+  assert_always("Game requested exit to dashboard via XamLoaderTerminateTitle");
+
+  auto display_window = kernel_state()->emulator()->display_window();
+  auto imgui_drawer = kernel_state()->emulator()->imgui_drawer();
+
+  if (display_window && imgui_drawer) {
+    display_window->app_context().CallInUIThreadSynchronous(
+        [imgui_drawer, title, message]() {
+          auto dialog = xe::ui::ImGuiDialog::ShowMessageBox(
+              imgui_drawer, title.c_str(), message.c_str());
+
+          std::jthread([dialog]() {
+            while (!dialog->IsClosing()) {
+              std::this_thread::yield();
+            }
+
+            config::SaveConfig();
+            xe::FlushLog();
+
+            std::quick_exit(0);
+          }).detach();
+        });
+  }
+
   // This function does not return.
   kernel_state()->TerminateTitle();
 }
@@ -455,6 +487,18 @@ DECLARE_XAM_EXPORT1(RtlSetLastNTError, kNone, kImplemented);
 
 dword_result_t RtlGetLastError_entry() { return XThread::GetLastError(); }
 DECLARE_XAM_EXPORT1(RtlGetLastError, kNone, kImplemented);
+
+dword_result_t XGetOverlappedExtendedError_entry(
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!overlapped_ptr) {
+    return XThread::GetLastError();
+  }
+  if (overlapped_ptr->result == X_ERROR_IO_PENDING) {
+    return X_ERROR_IO_INCOMPLETE;
+  }
+  return static_cast<uint32_t>(overlapped_ptr->extended_error);
+}
+DECLARE_XAM_EXPORT1(XGetOverlappedExtendedError, kNone, kImplemented);
 
 dword_result_t GetLastError_entry() { return RtlGetLastError_entry(); }
 DECLARE_XAM_EXPORT1(GetLastError, kNone, kImplemented);

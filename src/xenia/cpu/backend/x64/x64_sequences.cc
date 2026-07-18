@@ -386,7 +386,25 @@ struct CONVERT_F32_F64
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Fpu);
     // TODO(benvanik): saturation check? cvtt* (trunc?)
-    e.vcvtsd2ss(i.dest, GetInputRegOrConstant(e, i.src1, e.xmm0));
+
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    e.vmovq(e.rax, src);
+    e.vcvtsd2ss(i.dest, src);
+    Xbyak::Label done;
+    e.mov(e.rcx, e.rax);
+    e.btr(e.rcx, 63);
+    e.mov(e.rdx, e.GetXmmConstPtr(XMMDoubleInf));
+    e.cmp(e.rcx, e.rdx);
+    e.jbe(done);  // finite or +/-inf
+
+    // NaN: float quiet bit (22) -> double quiet bit (51)
+    e.vmovd(e.ecx, i.dest);
+    e.and_(e.ecx, ~(1u << 22));
+    e.shr(e.rax, 51 - 22);
+    e.and_(e.eax, 1u << 22);
+    e.or_(e.ecx, e.eax);
+    e.vmovd(i.dest, e.ecx);
+    e.L(done);
   }
 };
 struct CONVERT_F64_I64
@@ -407,7 +425,26 @@ struct CONVERT_F64_F32
     : Sequence<CONVERT_F64_F32, I<OPCODE_CONVERT, F64Op, F32Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Fpu);
-    e.vcvtss2sd(i.dest, GetInputRegOrConstant(e, i.src1, e.xmm0));
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm0);
+
+    e.vmovd(e.eax, src);
+    e.vcvtss2sd(i.dest, src);
+
+    Xbyak::Label done;
+    e.mov(e.ecx, e.eax);
+    e.and_(e.ecx, e.GetXmmConstPtr(XMMAbsMaskPS));
+    e.cmp(e.ecx, e.GetXmmConstPtr(XMMFloatInf));
+    e.jbe(done);
+
+    // NaN: double quiet bit (51) -> float quiet bit (22)
+    e.vmovq(e.rcx, i.dest);
+    e.btr(e.rcx, 51);  // clear the bit the convert forced to 1
+    e.shr(e.eax, 22);
+    e.and_(e.eax, 1);
+    e.shl(e.rax, 51);
+    e.or_(e.rcx, e.rax);
+    e.vmovq(i.dest, e.rcx);
+    e.L(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_CONVERT, CONVERT_I32_F32, CONVERT_I32_F64,
@@ -564,11 +601,18 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
     // if 0 and -0, return 0! opposite of minfp
-    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
-    auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
     e.vmaxps(e.xmm2, src1, src2);
     e.vmaxps(e.xmm3, src2, src1);
-    e.vorps(i.dest, e.xmm2, e.xmm3);
+    e.vandps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
@@ -623,11 +667,18 @@ struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
 struct MIN_V128 : Sequence<MIN_V128, I<OPCODE_MIN, V128Op, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
-    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
-    auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+    const Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
+    const Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
+
     e.vminps(e.xmm2, src1, src2);
     e.vminps(e.xmm3, src2, src1);
-    e.vorps(i.dest, e.xmm2, e.xmm3);
+    e.vorps(e.xmm2, e.xmm2, e.xmm3);
+
+    e.vcmpunordps(e.xmm3, src1, src1);  // mask: vA is NaN
+    e.vblendvps(e.xmm3, src2, src1, e.xmm3);
+
+    e.vcmpunordps(i.dest, src1, src2);  // mask: vA or vB is NaN
+    e.vblendvps(i.dest, e.xmm2, e.xmm3, i.dest);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MIN, MIN_I8, MIN_I16, MIN_I32, MIN_I64, MIN_F32,

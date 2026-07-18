@@ -530,6 +530,11 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Flag from gamma_decode_pwl_resolve in resolve shader. Some games appear
+    // overexposed unless full 8_8_8_8_GAMMA resolves decode PWL gamma to
+    // linear before MSAA averaging / conversion, then write gamma bytes again
+    // for gamma dests. Off keeps the old byte averaging.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };
@@ -724,9 +729,19 @@ struct ResolveInfo {
     // Not doing -32...32 to -1...1 clamping here as a hack for k_16_16 and
     // k_16_16_16_16 blending emulation when using host render targets as it
     // would be inconsistent with the usual way of clearing with a depth quad.
-    // TODO(Triang3l): Check which 32-bit portion is in which register.
-    constants_out.rt_specific.clear_value[0] = rb_color_clear;
-    constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
+    if (color_edram_info.format_is_64bpp) {
+      // RB_COLOR_CLEAR_LO holds the lower 32 bits.
+      // Red | green << 16 for 16_16_16_16, red for 32_32_FLOAT.
+      // RB_COLOR_CLEAR holds the upper 32 bits.
+      // D3D builds the low dword as R | G << 16 and the high as B | A << 16,
+      // and writes to the _LO and base register respectively.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear_lo;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    } else {
+      // 32bpp clear values are only taken from RB_COLOR_CLEAR.
+      constants_out.rt_specific.clear_value[0] = rb_color_clear;
+      constants_out.rt_specific.clear_value[1] = rb_color_clear;
+    }
     constants_out.rt_specific.edram_info = color_edram_info;
     constants_out.coordinate_info = coordinate_info;
   }

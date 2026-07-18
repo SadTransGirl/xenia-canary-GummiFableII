@@ -19,7 +19,7 @@ jobs:
 
       - name: Cache Vulkan SDK
         id: cache-vulkan-sdk
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: C:\VulkanSDK
           key: ${{ runner.os }}-vulkan-sdk-${{ hashFiles('**/vulkan-sdk.exe') }}
@@ -40,12 +40,12 @@ jobs:
 
           # Verify shader tools are available
           foreach ($tool in @("glslangValidator", "spirv-opt", "spirv-dis")) {
-            $toolPath = "${env:VULKAN_SDK}\Bin\$tool.exe"
+            $toolPath = "${env:VULKAN_SDK}\Bin\${tool}.exe"
             if (Test-Path "$toolPath") {
               echo "$tool found at: $toolPath"
               & $toolPath --version 2>$null
             } else {
-              echo "Warning: $tool.exe not found at expected location"
+              echo "Warning: ${tool}.exe not found at expected location"
             }
           }
 
@@ -59,7 +59,9 @@ jobs:
           }
 
       - name: Download submodules
-        run: git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS
+        run: |- # Exclude unneeded submodules
+          $SUBMODULES=(Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
+          git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
 
       - name: Build Xenia
         run: python xenia-build.py build --config=Release --target=xenia-app

@@ -346,6 +346,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
+    uint32_t old_integer_scale_bits = binding.integer_scale_bits;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
@@ -359,6 +360,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle =
         GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    binding.integer_scale_bits =
+        GetIntegerScaleBits(fetch.format, fetch.num_format,
+                            binding.host_swizzle, binding.swizzled_signs);
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -372,7 +376,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed =
         texture_util::IsAnySignSigned(binding.swizzled_signs);
-    if (key_changed || binding.host_swizzle != old_host_swizzle ||
+    if (key_changed || binding.integer_scale_bits != old_integer_scale_bits ||
+        binding.host_swizzle != old_host_swizzle ||
         any_sign_is_not_signed != any_sign_was_not_signed ||
         any_sign_is_signed != any_sign_was_signed) {
       bindings_changed |= index_bit;
@@ -523,23 +528,38 @@ TextureCache::Texture::~Texture() {
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
 }
 
-void TextureCache::Texture::MakeUpToDateAndWatch(
+bool TextureCache::Texture::MakeUpToDateAndWatch(
     const global_unique_lock_type& global_lock) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
+  const bool watch_base = base_outdated_;
+  const bool watch_mips = mips_outdated_;
+  assert_true(global_lock.owns_lock());
+  if (watch_base &&
+      !shared_memory.IsRangeValid(
+          key().base_page << 12, xe::align(GetGuestBaseSize(), UINT32_C(16)))) {
+    return false;
+  }
+  if (watch_mips &&
+      !shared_memory.IsRangeValid(
+          key().mip_page << 12, xe::align(GetGuestMipsSize(), UINT32_C(16)))) {
+    return false;
+  }
+
+  if (watch_base) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback,
         this, nullptr, 0);
   }
-  if (mips_outdated_) {
+  if (watch_mips) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback,
         this, nullptr, 1);
   }
+  return true;
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -661,6 +681,50 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   texture->LogAction("Created");
   return texture;
 }
+
+// Packs the integer scale the fetch shader reads from the system constant to
+// undo the host sampler's normalization - the guest wants e.g. [0, 255], not
+// [0, 1]. 5 bits per output component: bits 0:3 = width - 1, bit 4 = signed.
+// The scale lands after swizzling, so each output lane walks the host swizzle
+// back to its source component's width; constant (0/1) lanes, gamma, and
+// non-fixed formats have nothing to rescale and stay 0.
+uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
+                                           uint32_t num_format,
+                                           uint32_t host_swizzle,
+                                           uint8_t swizzled_signs) {
+  // num_format 0 is the normalized/fractional fetch - nothing to rescale.
+  const FormatInfo& format_info = *FormatInfo::Get(guest_format);
+  uint32_t scale_bits = 0;
+
+  if (!num_format || !format_info.fixed) {
+    return 0;
+  }
+
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t source_component = (host_swizzle >> (i * 3)) & 0b111;
+    if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
+      continue;
+    }
+
+    xenos::TextureSign sign =
+        xenos::TextureSign((swizzled_signs >> (i * 2)) & 0b11);
+
+    uint8_t width = format_info.component_bits[source_component];
+    if (!width || width > 16 || sign == xenos::TextureSign::kGamma) {
+      continue;
+    }
+
+    uint32_t component_scale = uint32_t(width - 1);
+    if (sign == xenos::TextureSign::kSigned) {
+      component_scale |= UINT32_C(1) << 4;
+    }
+
+    scale_bits |= component_scale << (i * 5);
+  }
+
+  return scale_bits;
+}
+
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
   assert_true(n_textures <= 64);
   if (n_textures < 2) {
@@ -787,7 +851,9 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       // resolves as well to detect when the CPU wants to reuse the memory for a
       // regular texture or a vertex buffer, and thus the scaled resolve version
       // is not up to date anymore.
-      texture->MakeUpToDateAndWatch(crit);
+      if (!texture->MakeUpToDateAndWatch(crit)) {
+        continue;
+      }
 
       texture->LogAction("Loaded");
     }
@@ -867,7 +933,9 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+    return false;
+  }
 
   texture.LogAction("Loaded");
 

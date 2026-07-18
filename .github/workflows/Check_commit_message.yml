@@ -37,7 +37,7 @@ jobs:
               echo "::error::Commit $SHORT is missing a [Tag] prefix. Expected format: [Tag] Description (e.g. [CPU] Fix overflow in JIT)"
               FAILED=1
             fi
-          done <<< "${COMMITS}"
+          done <<< "$COMMITS"
 
           echo
 
