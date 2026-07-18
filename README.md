@@ -10,6 +10,21 @@ the game patches already set up.
 > applies.
 
 ---
+### Gummi's Disclaimer:
+
+## This was a pure passion project, Something for my mental health more than anything.
+
+## This isn't a replacement or anything like that for xenia or the WIP Recomp.
+
+## If any of the Xenia Dev's have issues with this just let me know and I will take it down. No issues.
+
+## I just wanted to have a more enjoyable version of Fable-II.
+
+## I used GOTY no TU1. So other versions might not work.
+
+
+### Enjoy. -Gummi.
+
 
 ## What's in this build
 
@@ -36,8 +51,6 @@ A full, setting-by-setting explanation of every change is in
 
 ## Getting it running
 
-### Option A — use the release build (recommended)
-
 1. Download the release `.zip` from the
    [Releases](https://github.com/SadTransGirl/xenia-canary-GummiFableII/releases)
    page.
@@ -52,20 +65,6 @@ A full, setting-by-setting explanation of every change is in
 
 That's it — the included config and patches are picked up automatically.
 
-### Option B — build from source
-
-See [docs/building.md](docs/building.md) for the full toolchain setup and the
-`xb` build script. In short:
-
-```
-xb setup
-xb build --config=Release
-```
-
-The build lands in `build\bin\Windows\Release\`. Copy a config preset from
-[`configs/`](configs/) next to the exe as `xenia-canary.config.toml`.
-
----
 
 ## Choosing a config preset
 
