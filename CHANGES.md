@@ -39,7 +39,6 @@ All settings live in `xenia-canary.config.toml`.
 ### Display (`[Display]`)
 | Setting | Does |
 |---|---|
-| `framerate_limit = 165` | Caps FPS to the display refresh. Bounds how far the CPU runs ahead — fixes "high FPS but floaty/laggy camera." Set this to **your** monitor's refresh rate. |
 | `postprocess_scaling_and_sharpening` | `cas` = sharpen only (best when already rendering at your target res), `fsr` = upscale + sharpen (best when rendering below target res). |
 | `draw_resolution_scale_x/y` | Internal render resolution multiplier (1 = native 720p, 2 = 2x). |
 
@@ -61,10 +60,8 @@ Ready-made configs are in [`configs/`](configs/). To use one, copy it over
 
 | Preset | Resolution | Sharpening | Best for |
 |---|---|---|---|
-| `xenia-canary.x1-cas.config.toml` | Native (720p) | CAS | Lowest GPU load, crisp at native. |
 | `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display. |
 | `xenia-canary.x2-cas.config.toml` | 2x | CAS | **Recommended** — sharp 2x with low overhead. |
-| `xenia-canary.x2-fsr.config.toml` | 2x | FSR | 2x with FSR sharpening (FSR mostly sharpens here since 2x is already high-res). |
 
 All presets share the same performance settings and fixes above — only the
 render scale and sharpener differ.
