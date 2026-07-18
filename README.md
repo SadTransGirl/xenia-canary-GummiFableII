@@ -75,17 +75,12 @@ want next to `xenia_canary.exe` and rename it to `xenia-canary.config.toml`**
 
 | Preset | Render resolution | Sharpening | Best for |
 |---|---|---|---|
-| `xenia-canary.x1-cas.config.toml` | Native (720p) | CAS | Lowest GPU load, crisp at native. |
-| `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display. |
-| `xenia-canary.x2-cas.config.toml` | 2× | CAS | **Recommended** — sharp 2× with low overhead. |
-| `xenia-canary.x2-fsr.config.toml` | 2× | FSR | 2× with FSR sharpening. |
+| `xenia-canary.x2-cas.config.toml` | 2× | CAS | **Recommended / default** — sharp 2× with low overhead. |
+| `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display; lighter GPU load. |
 
-All presets share the same performance settings and fixes — only the render
-scale and the sharpener differ.
-
-**Tune for your setup:** open the active `xenia-canary.config.toml` and set
-`framerate_limit` to *your* monitor's refresh rate (e.g. `60`, `144`, `165`).
-This bounds how far ahead the CPU runs and fixes floaty/laggy camera feel.
+Both presets share the same performance settings and fixes — only the render
+scale and the sharpener differ. The default `xenia-canary.config.toml` in the
+release is the x2-cas preset.
 
 ---
 
@@ -107,8 +102,6 @@ They're enabled by default (`apply_patches = true` in the config). Keep the
   which can be game-version specific. Enable `log_resolve_readback` in the config
   to find your version's address range, then set `readback_resolve_only_dest_bases`
   accordingly. Details in [CHANGES.md](CHANGES.md#fable-ii-fixes).
-- **High FPS but the camera feels floaty** — set `framerate_limit` to your
-  monitor's refresh rate.
 - **Stutter / low FPS at 2×** — try the `x1-fsr` preset (native render, upscaled).
 
 ---
