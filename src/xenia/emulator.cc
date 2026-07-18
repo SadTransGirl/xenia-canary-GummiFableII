@@ -25,8 +25,11 @@
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
 #include "xenia/base/literals.h"
+#include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
+#include "xenia/base/string_buffer.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
@@ -1291,9 +1294,24 @@ bool Emulator::ExceptionCallback(Exception* ex) {
                                current_thread->thread_id()));
   crash_msg.append(
       fmt::format("Thread Handle: 0x{:08X}\n", current_thread->handle()));
-  crash_msg.append(
-      fmt::format("PC: 0x{:08X}\n",
-                  guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  uint32_t crash_guest_pc = guest_function->MapMachineCodeToGuestAddress(ex->pc());
+  crash_msg.append(fmt::format("PC: 0x{:08X}\n", crash_guest_pc));
+  // Disassemble the guest code around the fault so the actual bad instruction
+  // (and its operands' provenance) can be read directly from the crash log,
+  // rather than having to infer it from registers alone.
+  crash_msg.append("Disassembly:\n");
+  for (uint32_t a = crash_guest_pc - 0x40; a <= crash_guest_pc + 0x10; a += 4) {
+    auto* p = memory()->TranslateVirtual<uint32_t*>(a);
+    if (!p) {
+      continue;
+    }
+    uint32_t code = xe::byte_swap(*p);
+    StringBuffer sb;
+    cpu::ppc::DisasmPPC(a, code, &sb);
+    crash_msg.append(fmt::format("{} {:08X}: {:08X}  {}\n",
+                                 a == crash_guest_pc ? "->" : "  ", a, code,
+                                 sb.to_string_view()));
+  }
   if (ex->code() == Exception::Code::kAccessViolation) {
     const char* op_str = "unknown";
     if (ex->access_violation_operation() ==

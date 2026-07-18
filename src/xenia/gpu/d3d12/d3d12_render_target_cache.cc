@@ -65,6 +65,32 @@ DEFINE_string(
     "clears not to work).",
     "GPU");
 
+// Defined in d3d12_command_processor.cc. When set, k_2_10_10_10_FLOAT (FP10,
+// 7e3) render targets on the RTV path are backed by an R16G16B16A16_UNORM
+// resource with RGB scaled by 1/31.875 (so the 7e3 range [0, 31.875] maps to
+// UNORM [0, 1]) and alpha stored directly. The hardware UNORM blender then
+// saturates additive results at 1.0 (== 31.875 for RGB, == 1.0 for the 2-bit
+// alpha), matching console EDRAM's 7e3 clamp - which the float16 backing can't
+// do, so bright additive HDR (Fable II's moon halo alpha reaching 2.0) blows
+// out. Every FP10 read/write site (pixel output, transfer, dump, clear) applies
+// the matching 1/31.875 or 31.875 RGB scale; alpha is never scaled.
+DECLARE_bool(gpu_clamp_fp10_edram_output);
+
+DEFINE_bool(
+    readback_resolve_downsample_via_scratch, false,
+    "At resolution scales above 1x, write the CPU-readback downsample of a "
+    "resolve into the command processor's scratch GPU buffer instead of the "
+    "512 MB shared-memory buffer (Lever C). The readback copy then reads the "
+    "scratch buffer, so shared memory is no longer transitioned "
+    "UAV<->COPY_SOURCE around every readback resolve (roughly ten times a "
+    "frame in Fable II, serialized against every draw that binds shared "
+    "memory) and no longer needs a sparse commit of the destination range. "
+    "The downsample output exists only for the CPU; the GPU reads the scaled "
+    "resolve data directly, so skipping the shared-memory write is safe. If "
+    "morph textures break with this on, set it back to false. No effect at "
+    "1x or when readback is disabled.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 namespace d3d12 {
@@ -99,6 +125,11 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_64bpp_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_8bpp_cs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_full_8bpp_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_downsample_8bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_downsample_16bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_downsample_32bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_downsample_64bpp_cs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/resolve_downsample_128bpp_cs.h"
 }  // namespace shaders
 
 constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
@@ -136,6 +167,22 @@ constexpr D3D12RenderTargetCache::ResolveCopyShaderCode
          sizeof(shaders::resolve_full_128bpp_cs),
          shaders::resolve_full_128bpp_scaled_cs,
          sizeof(shaders::resolve_full_128bpp_scaled_cs)},
+};
+
+constexpr D3D12RenderTargetCache::ResolveDownsampleShaderCode
+    D3D12RenderTargetCache::kResolveDownsampleShaders
+        [D3D12RenderTargetCache::kResolveDownsampleShaderCount] = {
+            // Indexed by bytes-per-block log2.
+            {shaders::resolve_downsample_8bpp_cs,
+             sizeof(shaders::resolve_downsample_8bpp_cs)},
+            {shaders::resolve_downsample_16bpp_cs,
+             sizeof(shaders::resolve_downsample_16bpp_cs)},
+            {shaders::resolve_downsample_32bpp_cs,
+             sizeof(shaders::resolve_downsample_32bpp_cs)},
+            {shaders::resolve_downsample_64bpp_cs,
+             sizeof(shaders::resolve_downsample_64bpp_cs)},
+            {shaders::resolve_downsample_128bpp_cs,
+             sizeof(shaders::resolve_downsample_128bpp_cs)},
 };
 
 constexpr uint32_t D3D12RenderTargetCache::kTransferUsedRootParameters[size_t(
@@ -426,6 +473,75 @@ bool D3D12RenderTargetCache::Initialize() {
     resolve_copy_pipeline->SetName(
         reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+  }
+
+  // Create the resolution-scaled resolve -> 1x downsample root signature and
+  // pipelines (only needed when resolution scaling is active, for CPU readback
+  // of resolve results).
+  if (draw_resolution_scaled) {
+    std::array<D3D12_ROOT_PARAMETER, 3> resolve_downsample_root_parameters;
+    // Parameter 0 - constants (draw_util::ResolveCopyShaderConstants, with
+    // dest_base reused as the 1x guest destination base).
+    resolve_downsample_root_parameters[0].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    resolve_downsample_root_parameters[0].Constants.ShaderRegister = 0;
+    resolve_downsample_root_parameters[0].Constants.RegisterSpace = 0;
+    resolve_downsample_root_parameters[0].Constants.Num32BitValues =
+        sizeof(draw_util::ResolveCopyShaderConstants) / sizeof(uint32_t);
+    resolve_downsample_root_parameters[0].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+    // Parameter 1 - destination (shared memory).
+    resolve_downsample_root_parameters[1].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_UAV;
+    resolve_downsample_root_parameters[1].Descriptor.ShaderRegister = 0;
+    resolve_downsample_root_parameters[1].Descriptor.RegisterSpace = 0;
+    resolve_downsample_root_parameters[1].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+    // Parameter 2 - source (current scaled resolve range).
+    resolve_downsample_root_parameters[2].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_SRV;
+    resolve_downsample_root_parameters[2].Descriptor.ShaderRegister = 0;
+    resolve_downsample_root_parameters[2].Descriptor.RegisterSpace = 0;
+    resolve_downsample_root_parameters[2].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC resolve_downsample_root_signature_desc;
+    resolve_downsample_root_signature_desc.NumParameters =
+        UINT(resolve_downsample_root_parameters.size());
+    resolve_downsample_root_signature_desc.pParameters =
+        resolve_downsample_root_parameters.data();
+    resolve_downsample_root_signature_desc.NumStaticSamplers = 0;
+    resolve_downsample_root_signature_desc.pStaticSamplers = nullptr;
+    resolve_downsample_root_signature_desc.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    resolve_downsample_root_signature_ = ui::d3d12::util::CreateRootSignature(
+        provider, resolve_downsample_root_signature_desc);
+    if (resolve_downsample_root_signature_ == nullptr) {
+      XELOGE(
+          "D3D12RenderTargetCache: Failed to create the resolve downsample root "
+          "signature");
+      Shutdown();
+      return false;
+    }
+    for (size_t i = 0; i < kResolveDownsampleShaderCount; ++i) {
+      const ResolveDownsampleShaderCode& resolve_downsample_shader_code =
+          kResolveDownsampleShaders[i];
+      assert_true(resolve_downsample_shader_code.code &&
+                  resolve_downsample_shader_code.size);
+      ID3D12PipelineState* resolve_downsample_pipeline =
+          ui::d3d12::util::CreateComputePipeline(
+              device, resolve_downsample_shader_code.code,
+              resolve_downsample_shader_code.size,
+              resolve_downsample_root_signature_);
+      if (resolve_downsample_pipeline == nullptr) {
+        XELOGE(
+            "D3D12RenderTargetCache: Failed to create resolve downsample "
+            "pipeline {}",
+            i);
+        Shutdown();
+        return false;
+      }
+      resolve_downsample_pipelines_[i] = resolve_downsample_pipeline;
+    }
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -1144,6 +1260,11 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::d3d12::util::ReleaseAndNull(resolve_copy_root_signature_);
 
+  for (size_t i = 0; i < xe::countof(resolve_downsample_pipelines_); ++i) {
+    ui::d3d12::util::ReleaseAndNull(resolve_downsample_pipelines_[i]);
+  }
+  ui::d3d12::util::ReleaseAndNull(resolve_downsample_root_signature_);
+
   edram_snapshot_restore_pool_.reset();
   ui::d3d12::util::ReleaseAndNull(edram_snapshot_download_buffer_);
 
@@ -1294,13 +1415,17 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-bool D3D12RenderTargetCache::Resolve(const Memory& memory,
-                                     D3D12SharedMemory& shared_memory,
-                                     D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out,
-                                     uint32_t& written_length_out) {
+bool D3D12RenderTargetCache::Resolve(
+    const Memory& memory, D3D12SharedMemory& shared_memory,
+    D3D12TextureCache& texture_cache, uint32_t& written_address_out,
+    uint32_t& written_length_out,
+    bool resolve_to_shared_memory_for_readback, uint64_t readback_max_length,
+    ID3D12Resource** readback_staging_out) {
   written_address_out = 0;
   written_length_out = 0;
+  if (readback_staging_out) {
+    *readback_staging_out = nullptr;
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1413,6 +1538,137 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
                                           resolve_info.copy_dest_extent_length);
         written_address_out = resolve_info.copy_dest_extent_start;
         written_length_out = resolve_info.copy_dest_extent_length;
+
+        // With resolution scaling, the resolve wrote into the scaled resolve
+        // buffer rather than shared memory, so the 1x guest mirror has no data
+        // for the CPU to read back. GPU-downsample the scaled result back into
+        // shared memory (nearest-neighbor - taking the top-left host subpixel of
+        // each guest block) so resolve readback works at >1x without a CPU-side
+        // downscale or a full GPU stall. The scaled range is still current here.
+        // Skip it for resolves bigger than the readback size cap: the command
+        // processor won't copy those back anyway (readback_resolve_max_length),
+        // so downsampling them just wastes GPU bandwidth and needlessly
+        // transitions the 512 MB shared-memory buffer (Lever A).
+        if (draw_resolution_scaled && resolve_to_shared_memory_for_readback &&
+            (!readback_max_length ||
+             resolve_info.copy_dest_extent_length <= readback_max_length)) {
+          uint32_t downsample_bpb_log2 = 0;
+          bool downsample_supported = true;
+          switch (copy_shader) {
+            case draw_util::ResolveCopyShaderIndex::kFull8bpp:
+              downsample_bpb_log2 = 0;
+              break;
+            case draw_util::ResolveCopyShaderIndex::kFull16bpp:
+              downsample_bpb_log2 = 1;
+              break;
+            case draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA:
+            case draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA:
+            case draw_util::ResolveCopyShaderIndex::kFull32bpp:
+              downsample_bpb_log2 = 2;
+              break;
+            case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
+            case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
+            case draw_util::ResolveCopyShaderIndex::kFull64bpp:
+              downsample_bpb_log2 = 3;
+              break;
+            case draw_util::ResolveCopyShaderIndex::kFull128bpp:
+              downsample_bpb_log2 = 4;
+              break;
+            default:
+              downsample_supported = false;
+              break;
+          }
+          // Lever C: prefer routing the downsample into the command
+          // processor's scratch GPU buffer - the readback copy then doesn't
+          // transition the 512 MB shared-memory buffer (serialized against
+          // every draw that binds it) or need a sparse commit of the
+          // destination range. The 1x data is consumed only by the CPU (the
+          // GPU reads the scaled resolve data directly), so bypassing shared
+          // memory is safe.
+          ID3D12Resource* downsample_staging = nullptr;
+          if (downsample_supported && readback_staging_out &&
+              cvars::readback_resolve_downsample_via_scratch) {
+            downsample_staging = command_processor_.RequestScratchGPUBuffer(
+                resolve_info.copy_dest_extent_length,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          }
+          // Without the scratch route, the downsample writes shared memory
+          // (the 1x guest mirror); the scaled resolve path didn't commit
+          // shared memory for this range (it wrote the scaled buffer), so
+          // commit it now as the downsample dest.
+          if (downsample_supported &&
+              (downsample_staging ||
+               shared_memory.RequestRange(
+                   resolve_info.copy_dest_extent_start,
+                   resolve_info.copy_dest_extent_length))) {
+            command_list.D3DSetComputeRootSignature(
+                resolve_downsample_root_signature_);
+            // Source - the current scaled resolve range just written above.
+            texture_cache.TransitionCurrentScaledResolveRange(
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            command_list.D3DSetComputeRootShaderResourceView(
+                2, texture_cache.GetCurrentScaledResolveRangeGPUAddress());
+            draw_util::ResolveCopyShaderConstants downsample_constants =
+                copy_shader_constants;
+            if (downsample_staging) {
+              // Destination - the scratch buffer. The shader writes to (1x
+              // tiled address + dest_base); rebasing dest_base by the copy
+              // dest extent start (32-bit wrapping arithmetic, matching the
+              // shader's uint address math) relocates the guest byte range
+              // [extent_start, extent_start + length) to [0, length) in the
+              // scratch buffer.
+              command_list.D3DSetComputeRootUnorderedAccessView(
+                  1, downsample_staging->GetGPUVirtualAddress());
+              downsample_constants.dest_base -=
+                  resolve_info.copy_dest_extent_start;
+            } else {
+              // Destination - shared memory (the 1x guest mirror).
+              shared_memory.UseForWriting();
+              command_list.D3DSetComputeRootUnorderedAccessView(
+                  1, shared_memory.GetGPUAddress());
+            }
+            // Constants - the same resolve copy constants; dest_base holds the
+            // 1x guest destination base the downsample shader needs.
+            command_list.D3DSetComputeRoot32BitConstants(
+                0, sizeof(downsample_constants) / sizeof(uint32_t),
+                &downsample_constants, 0);
+            // Each thread relocates a run of consecutive 1x guest X blocks that
+            // forms one aligned, contiguous destination chunk - 8 bytes for
+            // 8bpp/16bpp, 16 bytes for 32/64/128bpp (matching the store width of
+            // the corresponding resolve copy shader and the guest tiling's
+            // contiguous run; must stay in sync with resolve_downsample.xesli's
+            // XE_DOWNSAMPLE_BLOCKS_PER_THREAD).
+            uint32_t downsample_chunk_bytes =
+                downsample_bpb_log2 <= 1u ? 8u : 16u;
+            uint32_t downsample_blocks_per_thread =
+                downsample_chunk_bytes >> downsample_bpb_log2;
+            uint32_t downsample_guest_width =
+                resolve_info.coordinate_info.width_div_8 << 3;
+            uint32_t downsample_guest_height = resolve_info.height_div_8 << 3;
+            uint32_t downsample_threads_x =
+                (downsample_guest_width + downsample_blocks_per_thread - 1) /
+                downsample_blocks_per_thread;
+            uint32_t downsample_group_count_x =
+                (downsample_threads_x + 63) / 64;
+            command_processor_.SetExternalPipeline(
+                resolve_downsample_pipelines_[downsample_bpb_log2]);
+            command_processor_.SubmitBarriers();
+            command_list.D3DDispatch(downsample_group_count_x,
+                                     downsample_guest_height, 1);
+            if (downsample_staging) {
+              // Hand the scratch buffer to the caller for the readback copy
+              // (reservation still held, state UNORDERED_ACCESS); ordering of
+              // the downsample writes against the copy comes from the
+              // caller's transition to COPY_SOURCE.
+              *readback_staging_out = downsample_staging;
+            } else {
+              // Order the downsample writes with the readback copy that
+              // follows.
+              shared_memory.MarkUAVWritesCommitNeeded();
+            }
+          }
+        }
+
         copied = true;
       } else {
         XELOGE(
@@ -1693,7 +1949,13 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
       return DXGI_FORMAT_R10G10B10A2_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+      // Normally float16 (wider range, exact for the 7e3 values). With the FP10
+      // UNORM-saturate emulation, back it with UNORM16 scaled so the 7e3 range
+      // [0, 31.875] maps to [0, 1], so the hardware blender saturates additive
+      // results like console EDRAM (fixes the Fable II moon halo alpha blowout).
+      return cvars::gpu_clamp_fp10_edram_output
+                 ? DXGI_FORMAT_R16G16B16A16_UNORM
+                 : DXGI_FORMAT_R16G16B16A16_FLOAT;
     // SNORM has two representations of -1.
     case xenos::ColorRenderTargetFormat::k_16_16:
       return DXGI_FORMAT_R16G16_TYPELESS;
@@ -3692,9 +3954,27 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
                       dest_color_format ==
                           xenos::ColorRenderTargetFormat::
                               k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
-            a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
+            // Same-format FP10 transfer. RGB is copied as-is (float16, may be
+            // HDR up to 31.875). Alpha is SATURATED to [0,1] to emulate the
+            // console 2-bit FP10 alpha: on the RTV float16 host RT, additive
+            // blending lets alpha accumulate past 1.0 (Fable II moon halo -
+            // dst alpha 1.0 + additive halo alpha 1.0 = 2.0), and a raw copy
+            // would propagate that unclamped value to whatever samples this
+            // transfer's result, turning the soft glow into a hard disc. The
+            // FP10->non-FP10 branch below already saturates alpha; this makes
+            // the FP10->FP10 path consistent (and console-correct).
+            a.OpMov(dxbc::Dest::O(0, 0b0111), dxbc::Src::R(1));
+            a.OpMov(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                    true);
           } else {
             color_packed_in_r1x = true;
+            // FP10 UNORM-saturate: the source host RT RGB is scaled UNORM
+            // (holds value/31.875); recover the actual 7e3 value before packing
+            // to the non-FP10 destination. Alpha is [0,1] and needs no scale.
+            if (cvars::gpu_clamp_fp10_edram_output) {
+              a.OpMul(dxbc::Dest::R(1, 0b0111), dxbc::Src::R(1),
+                      dxbc::Src::LF(31.875f));
+            }
             // Float16 has a wider range for both color and alpha, also NaNs -
             // clamp and convert.
             for (uint32_t i = 0; i < 3; ++i) {
@@ -3829,10 +4109,23 @@ D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-              // Color using r1.yz as temporary.
+              // Color using r1.yz as temporary. Decode the 7e3 value into r0
+              // (any register is free here - end of shader), then for the FP10
+              // UNORM-saturate host resource scale RGB by 1/31.875 to encode
+              // the [0, 31.875] value into UNORM [0, 1]. Without this scale a
+              // non-FP10 (e.g. 8_8_8_8) source reinterpreted into an FP10 dest
+              // writes the raw 7e3 value straight into the UNORM buffer, so
+              // bright pixels land at ~31.875 and clamp to white (Fable II moon
+              // blowout). Alpha is 2-bit [0,1] and needs no scale.
               for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i),
+                DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::R(0, 1 << i),
                                                    1, 0, i * 10, 1, 1, 1, 2);
+              }
+              if (cvars::gpu_clamp_fp10_edram_output) {
+                a.OpMul(dxbc::Dest::O(0, 0b0111), dxbc::Src::R(0),
+                        dxbc::Src::LF(1.0f / 31.875f));
+              } else {
+                a.OpMov(dxbc::Dest::O(0, 0b0111), dxbc::Src::R(0));
               }
               // Alpha.
               a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(2),
@@ -5406,9 +5699,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
           case xenos::ColorRenderTargetFormat::
               k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+            // With FP10 UNORM-saturate emulation, RGB is stored in a scaled
+            // UNORM16 host resource, so scale the 7e3 clear value from
+            // [0, 31.875] into [0, 1]. Alpha (2-bit) is already [0, 1].
+            float fp10_rgb_clear_scale =
+                cvars::gpu_clamp_fp10_edram_output ? (1.0f / 31.875f) : 1.0f;
             for (uint32_t j = 0; j < 3; ++j) {
               color_clear_value[j] =
-                  xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF);
+                  xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF) *
+                  fp10_rgb_clear_scale;
             }
             color_clear_value[3] = ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
           } break;
@@ -6292,6 +6591,13 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
         break;
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+        // With FP10 UNORM-saturate emulation, the source host RT is scaled
+        // UNORM (RGB holds value/31.875); recover the actual 7e3 value before
+        // packing. Alpha is stored directly ([0,1]) and needs no scale.
+        if (cvars::gpu_clamp_fp10_edram_output && !source_is_uint) {
+          a.OpMul(dxbc::Dest::R(1, 0b0111), dxbc::Src::R(1),
+                  dxbc::Src::LF(31.875f));
+        }
         // Float16 has a wider range for both color and alpha, also NaNs.
         // Color - clamp and convert.
         // Convert red in r1.x to the result register r1.x - the same, but

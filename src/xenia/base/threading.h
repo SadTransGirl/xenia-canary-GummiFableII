@@ -110,8 +110,24 @@ void set_name(const std::string_view name);
 // Yields the current thread to the scheduler. Maybe.
 void MaybeYield();
 
+// Raises the current process's scheduling priority above normal so the emulator
+// keeps getting CPU time when the host is busy with other demanding apps.
+// Best-effort: returns true if the priority was raised. No-op on platforms that
+// don't support it.
+bool EnableAboveNormalProcessPriority();
+
 // Memory barrier (request - may be ignored).
 void SyncMemory();
+
+// Diagnostic: total number of guest db16cyc spin-pause executions across all
+// threads (incremented by the x64 backend's spin-pause handler). Used to detect
+// whether a freeze is a db16cyc busy-wait livelock - if this rate spikes during
+// a freeze, a guest thread is spinning on db16cyc. Relaxed, best-effort.
+extern std::atomic<uint64_t> g_db16cyc_spin_count;
+// Monotonic sequence stamped on each guest dispatcher signal/reset op, so the
+// exact ordering of a producer's Set vs a consumer's Reset can be recovered
+// even within the same millisecond (deadlock diagnostics).
+extern std::atomic<uint64_t> g_dispatch_seq;
 
 // Sleeps the current thread for at least as long as the given duration.
 void Sleep(std::chrono::microseconds duration);

@@ -39,6 +39,14 @@ class XEvent : public XObject {
   void Query(uint32_t* out_type, uint32_t* out_state);
   void Clear();
 
+  int32_t DbgResetMode() const override { return manual_reset_ ? 0 : 1; }
+  bool WatchdogResignal() override {
+    Set(0, false);
+    return true;
+  }
+
+  void WaitCallback() override;
+
   bool Save(ByteStream* stream) override;
   static object_ref<XEvent> Restore(KernelState* kernel_state,
                                     ByteStream* stream);
@@ -47,6 +55,10 @@ class XEvent : public XObject {
   xe::threading::WaitHandle* GetWaitHandle() override { return event_.get(); }
 
  private:
+  // Mirror the host event state into the guest KEVENT dispatcher header's
+  // signal_state so guest code polling it directly stays consistent.
+  void SyncGuestSignalState(uint32_t state);
+
   bool manual_reset_ = false;
   std::unique_ptr<xe::threading::Event> event_;
 };

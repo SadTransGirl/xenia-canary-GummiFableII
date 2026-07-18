@@ -111,6 +111,11 @@ struct X64BackendContext {
   unsigned int flags;
   unsigned int Ox1000;  // constant 0x1000 so we can shrink each tail emitted
                         // add of it by... 2 bytes lol
+  // Per-thread db16cyc spin-pause counter. Incremented inline by the
+  // DELAY_EXECUTION (db16cyc) sequence; every 128th increment triggers a real
+  // short sleep to break spin-wait livelocks without a host call on the common
+  // path. (delay_via_maybeyield mode only.)
+  unsigned int spin_pause_count;
 };
 constexpr unsigned int DEFAULT_VMX_MXCSR =
     0x8000 |                   // flush to zero

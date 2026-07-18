@@ -44,6 +44,9 @@
 #include "xenia/ui/d3d12/d3d12_util.h"
 
 namespace xe {
+
+class Exception;
+
 namespace gpu {
 
 enum class D3D12GPUSetting {
@@ -302,7 +305,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base,
                                   uint32_t num_registers);
 
-  void OnGammaRamp256EntryTableValueWritten() override;
+  void OnGammaRamp256EntryTableValueWritten(bool wrapped_to_start) override;
   void OnGammaRampPWLValueWritten() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -678,6 +681,16 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint8_t* gamma_ramp_upload_buffer_mapping_ = nullptr;
   bool gamma_ramp_256_entry_table_up_to_date_ = false;
   bool gamma_ramp_pwl_up_to_date_ = false;
+  // Read-while-write race mitigation for the 256-entry gamma table (see
+  // CommandProcessor::OnGammaRamp256EntryTableValueWritten): the guest writes
+  // it via 256 sequential register writes, and uploading it mid-sequence can
+  // capture a partially-written table (observed in Fable II: a hard-edged,
+  // wrongly-bright halo around the moon caused by sampling a gamma table that
+  // was only half-written when Xenia snapshotted it). Defer the upload while
+  // a write sequence looks in-progress, with a bounded timeout as a safety
+  // net in case the guest ever does a genuine partial (non-wrapping) update.
+  bool gamma_ramp_256_entry_table_write_in_progress_ = false;
+  uint64_t gamma_ramp_256_entry_table_write_started_ms_ = 0;
 
   struct ApplyGammaConstants {
     uint32_t size[2];
@@ -741,15 +754,155 @@ class D3D12CommandProcessor final : public CommandProcessor {
   D3D12_RESOURCE_STATES scratch_buffer_state_;
   bool scratch_buffer_used_ = false;
 
-  // Per-resolve double-buffered readback for delayed sync
+  // Per-resolve readback buffer (GPU copy of a resolve's shared-memory range).
+  // The resolve copy into this buffer is recorded without a stall; the map to
+  // guest RAM is deferred to the next GPU->CPU sync point (see
+  // FlushReadbacksForGuestVisibility). In "fast"/"full" only the first slot is
+  // ever used (drained immediately at the next fence). In "deferred" the copy of
+  // one resolve may still be in flight when the same key is resolved again, so
+  // current_index advances through a small ring; a slot that an undelivered
+  // deferred fence still reads is never overwritten (see ReadbackSlotInFlight).
+  static constexpr uint32_t kReadbackRingSize = 4;
   struct ReadbackBuffer {
-    ID3D12Resource* buffers[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
+    ID3D12Resource* buffers[kReadbackRingSize] = {};
+    uint32_t sizes[kReadbackRingSize] = {};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+
+  // Resolve readbacks whose GPU copy has been recorded but not yet mapped to
+  // guest RAM. Keyed by the same (address, length) key as readback_buffers_,
+  // keeping only the latest resolve per key (same key == same guest address, so
+  // a newer resolve supersedes an older one the guest hasn't observed yet).
+  // Drained by FlushReadbacksForGuestVisibility() at GPU->CPU sync points.
+  struct PendingReadback {
+    uint32_t guest_address = 0;
+    uint32_t length = 0;
+    uint32_t buffer_index = 0;
+  };
+  std::unordered_map<uint64_t, PendingReadback> pending_readbacks_;
+  void FlushReadbacksForGuestVisibility(bool at_fence_sync) override;
+
+  // "deferred" readback mode (see ReadbackResolveMode::kDeferred). Instead of
+  // stalling the command processor at a fence to deliver pending readbacks, the
+  // recorded GPU copies are submitted (without waiting) and the fence value the
+  // guest polls is held back in a DeferredFence until that submission completes
+  // on its own. TryCompleteDeferredFences then maps each readback to guest RAM
+  // and finally stores the fence value, so the guest can never observe the fence
+  // before its morph data is in RAM - but the GPU is not drained to idle.
+  struct DeferredReadback {
+    uint64_t key = 0;  // readback_buffers_ key
+    uint32_t guest_address = 0;
+    uint32_t length = 0;
+    uint32_t buffer_index = 0;
+  };
+  struct DeferredFence {
+    uint8_t* write_destination = nullptr;
+    uint32_t data_value = 0;
+    uint64_t target_submission = 0;
+    std::vector<DeferredReadback> readbacks;
+  };
+  std::deque<DeferredFence> deferred_fences_;
+  bool HandleFenceWriteWithReadback(uint8_t* write_destination,
+                                    uint32_t data_value) override;
+  // Deliver deferred fences whose GPU work has completed (and, when block, wait
+  // for the oldest outstanding one). Writes each fence value only after its
+  // readbacks reach guest RAM.
+  void TryCompleteDeferredFences(bool block);
+  // Lazy deferred mode: move pending_readbacks_ into a valueless DeferredFence
+  // gated on the submission holding their GPU copies (submitting it without
+  // waiting), so they are delivered by TryCompleteDeferredFences when the GPU
+  // finishes on its own instead of stalling now. Returns false if the copies
+  // couldn't be submitted (caller falls back to the blocking path).
+  bool DeferPendingReadbacksAsFence();
+  // True if an undelivered deferred fence still reads this key's ring slot, so
+  // recording a new copy there would clobber data the guest hasn't seen yet.
+  bool ReadbackSlotInFlight(uint64_t key, uint32_t slot) const;
+  // True if [address, address+length) in guest physical memory is committed and
+  // writable. Checked before recording a readback copy and again before
+  // delivering a deferred one to guest RAM - an area change between defer and
+  // delivery can free/remap the destination, and writing then would corrupt
+  // memory or crash.
+  bool IsReadbackDestinationWritable(uint32_t address, uint32_t length) const;
+
+  // Diagnostic (cvar trace_nonfinite_matrix_writer): when the draw-time
+  // detector finds a non-finite float in a vertex/transform buffer, watch that
+  // page so the next guest write to it logs the writing guest thread's link
+  // register and PPC call stack - to find the CPU code that produces the bad
+  // (Inf) matrix that explodes Fable II's dog.
+  void ArmNonfiniteWriterTrace(uint32_t physical_base);
+  std::pair<uint32_t, uint32_t> NonfiniteWriterCallback(uint32_t address,
+                                                        uint32_t length);
+  static std::pair<uint32_t, uint32_t> NonfiniteWriterCallbackThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length,
+      bool exact_range);
+  void* nonfinite_writer_callback_handle_ = nullptr;
+  std::atomic<uint32_t> nonfinite_trace_base_{0};
+  std::atomic<uint32_t> nonfinite_trace_captures_{0};
+  // When a captured writer turns out to be a data-mover (byte-swap/scatter
+  // serializer), it stashes the page of its *source* buffer here so a safe
+  // point (IssueDraw) can arm the source watch one level up, toward the real
+  // float computation that produces the Inf. Set by the callback, read
+  // (without clearing, so the watch re-arms after each capture) outside the
+  // memory lock.
+  std::atomic<uint32_t> nonfinite_trace_rearm_page_{0};
+
+  // Second stage of the writer trace: the serializer's source buffer is a
+  // guest *virtual*-heap address, which PhysicalMemoryInvalidationCallback can
+  // never watch (it only covers the physical heaps - the reason the earlier
+  // re-arm on the source page silently caught nothing). Instead the host page
+  // backing it is made read-only, and the access-violation handler logs the
+  // writing host RIP resolved to the guest function/instruction, unprotects
+  // the page so the write proceeds, and lets IssueDraw re-arm for the next
+  // capture.
+  void ArmNonfiniteSourceWatch(uint32_t guest_page);
+  static bool NonfiniteSourceWatchHandlerThunk(Exception* ex, void* data);
+  bool NonfiniteSourceWatchHandler(Exception* ex);
+  // Host base of the watched (read-only) page; null when not armed.
+  std::atomic<uint8_t*> nonfinite_source_host_base_{nullptr};
+  // Host base of the page most recently protected; NOT cleared on disarm.
+  // Two guest threads can fault on the watched page concurrently: the first
+  // handler unprotects and disarms, and the second must still recognize the
+  // fault as ours and retry (against the now-writable page) instead of
+  // falling through to a crash.
+  std::atomic<uint8_t*> nonfinite_source_watch_window_{nullptr};
+  uint32_t nonfinite_source_guest_page_ = 0;
+  std::atomic<uint32_t> nonfinite_source_captures_{0};
+  bool nonfinite_source_handler_installed_ = false;
+
+  void PrepareForWait() override;
+
+  // Per-frame readback instrumentation, logged once per frame at IssueSwap when
+  // log_resolve_readback is set. Counts the GPU readback work and, crucially,
+  // the wall-time spent stalling the GPU to idle for readback - the metric that
+  // shows whether the resolve path is the framerate bottleneck.
+  uint32_t readback_frame_resolves_copied_ = 0;
+  uint32_t readback_frame_fence_stalls_ = 0;
+  uint32_t readback_frame_deferred_delivered_ = 0;
+  uint64_t readback_frame_stall_ns_ = 0;
+  // Attribution of readback_frame_stall_ns_ by the site that blocked, so a
+  // capture shows WHERE the remaining stall happens: per-fence sync (fast mode
+  // or the deferred fallback), the primary-buffer-end flush, the swap flush,
+  // command-processor idle (PrepareForWait), or the readback ring-slot guard.
+  enum ReadbackStallSite : uint32_t {
+    kReadbackStallSiteFence = 0,
+    kReadbackStallSiteBufferEnd,
+    kReadbackStallSiteSwap,
+    kReadbackStallSiteIdle,
+    kReadbackStallSiteRingGuard,
+    kReadbackStallSiteCount,
+  };
+  // Set by each blocking entry point before it may wait, read where the wait
+  // time is accumulated. Command-processor thread only, like the counters.
+  ReadbackStallSite readback_stall_site_ = kReadbackStallSiteFence;
+  uint64_t readback_frame_stall_site_ns_[kReadbackStallSiteCount] = {};
+  // Set during ShutdownContext so FlushReadbacksForGuestVisibility takes the
+  // synchronous delivery path even in lazy deferred mode - re-deferring at
+  // shutdown would leave a GPU copy in flight while its readback buffer is
+  // released just below (use-after-free on the GPU timeline).
+  bool readback_flush_at_shutdown_ = false;
 
   // Simple single buffer for memexport (always syncs, no double-buffering)
   ID3D12Resource* memexport_readback_buffer_ = nullptr;

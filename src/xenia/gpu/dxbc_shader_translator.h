@@ -247,6 +247,33 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
 
+    // Replace a non-finite (NaN/Inf) vertex shader output position with a safe
+    // finite value, so geometry fed bad transform data can't fly to infinity
+    // (mitigation for games whose CPU-supplied matrices intermittently contain
+    // Inf - e.g. Fable II's dog). Set from the cvar gpu_flush_nonfinite_vertex.
+    kSysFlag_FlushNonfinitePosition_Shift,
+
+    // Replace non-finite (NaN/Inf) components of fetched float vertex
+    // attributes with 0. Mitigation for meshes fed bad CPU-supplied float data
+    // (e.g. Fable II's dog, whose bone matrices intermittently have an Inf
+    // column): the matrix becomes finite so the mesh renders (slightly wrong
+    // pose) instead of exploding, and isn't skipped so it doesn't flicker. Set
+    // from the cvar gpu_flush_nonfinite_vertex_fetch.
+    kSysFlag_FlushNonfiniteVertexFetch_Shift,
+
+    // Clamp the pixel shader color output for render target i to the
+    // k_2_10_10_10_FLOAT (7e3) representable range ([0, 31.875] RGB, [0, 1]
+    // alpha) on the host-render-target (RTV) path. The float16 host resource
+    // backing an FP10 target does not clamp/quantize to the 7e3 range the way
+    // real Xbox 360 EDRAM (and the ROV path) does, so bright additive HDR
+    // content would otherwise accumulate past 31.875 and blow out after the
+    // game's tonemap (Fable II moon halo hard-disc bug). Only set for FP10
+    // targets on the RTV path.
+    kSysFlag_ClampColor0ToFloat10_Shift,
+    kSysFlag_ClampColor1ToFloat10_Shift,
+    kSysFlag_ClampColor2ToFloat10_Shift,
+    kSysFlag_ClampColor3ToFloat10_Shift,
+
     kSysFlag_Count,
 
     kSysFlag_SharedMemoryIsUAV = 1u << kSysFlag_SharedMemoryIsUAV_Shift,
@@ -271,6 +298,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite =
         1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_FlushNonfinitePosition =
+        1u << kSysFlag_FlushNonfinitePosition_Shift,
+    kSysFlag_FlushNonfiniteVertexFetch =
+        1u << kSysFlag_FlushNonfiniteVertexFetch_Shift,
+    kSysFlag_ClampColor0ToFloat10 = 1u << kSysFlag_ClampColor0ToFloat10_Shift,
+    kSysFlag_ClampColor1ToFloat10 = 1u << kSysFlag_ClampColor1ToFloat10_Shift,
+    kSysFlag_ClampColor2ToFloat10 = 1u << kSysFlag_ClampColor2ToFloat10_Shift,
+    kSysFlag_ClampColor3ToFloat10 = 1u << kSysFlag_ClampColor3ToFloat10_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

@@ -9,16 +9,20 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <atomic>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/sampler_info.h"
+#include "xenia/gpu/shader.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
@@ -45,6 +49,35 @@ DEFINE_bool(
     "of the guest thread that wrote the new read position.",
     "GPU");
 
+DEFINE_bool(
+    log_gamma_ramp_writes, false,
+    "Log the range of DC_LUT_30_COLOR/DC_LUT_SEQ_COLOR gamma ramp indices "
+    "the guest actually writes to (once, on the first write, and again "
+    "whenever a new high-water-mark index is reached). Diagnostic for "
+    "gamma-ramp-related visual corruption - shows whether the guest ever "
+    "writes the full 0-255 range or stops partway through.",
+    "GPU");
+
+namespace {
+void LogGammaRampWriteIfNewMax(uint32_t rw_index) {
+  static std::atomic<uint32_t> max_index_seen{0};
+  static std::atomic<bool> first_write_logged{false};
+  if (!cvars::log_gamma_ramp_writes) {
+    return;
+  }
+  if (!first_write_logged.exchange(true)) {
+    XELOGW("Gamma ramp: first write at index {}", rw_index);
+  }
+  uint32_t prev = max_index_seen.load(std::memory_order_relaxed);
+  while (rw_index > prev &&
+         !max_index_seen.compare_exchange_weak(prev, rw_index)) {
+  }
+  if (rw_index > prev) {
+    XELOGW("Gamma ramp: new high-water-mark index {}", rw_index);
+  }
+}
+}  // namespace
+
 DEFINE_bool(clear_memory_page_state, false,
             "Refresh state of memory pages to enable gpu written data. (Use "
             "for 'Team Ninja' Games to fix missing character models)",
@@ -69,9 +102,18 @@ DEFINE_string(
 DEFINE_string(
     readback_resolve, "none",
     "Controls CPU readback of render-to-texture resolve results.\n"
-    " fast: Read from previous frame (1 frame delay, no GPU stall, slight "
-    "performance hit)\n"
-    " full: Wait for GPU to finish (accurate but slow, GPU-CPU sync stall)\n"
+    " fast: Readback delivered to guest RAM at GPU->CPU sync points (fence "
+    "writes, primary buffer end, swap), batching the GPU stall across all "
+    "resolves since the last sync - correct and much faster than full\n"
+    " full: Stall the GPU and copy on every resolve (accurate but slow; use "
+    "only if a game reads resolves without a sync point fast misses)\n"
+    " deferred: Like fast, but instead of stalling the command processor at "
+    "each fence to deliver the readback, the fence value the guest polls is "
+    "itself deferred until the readback's GPU work finishes on its own - the "
+    "guest still never observes the fence before its data is in RAM, but the "
+    "GPU is no longer drained to idle at every fence. Highest framerate for "
+    "games that read many small resolves on the CPU (e.g. Fable II morphs at "
+    "high resolution scale); D3D12 only (Vulkan falls back to fast)\n"
     " none: Disable readback completely (some games render better without it)",
     "GPU");
 
@@ -115,10 +157,23 @@ ReadbackResolveMode GetReadbackResolveMode() {
   const std::string& mode = cvars::readback_resolve;
   if (mode == "full") {
     return ReadbackResolveMode::kFull;
+  } else if (mode == "deferred") {
+    return ReadbackResolveMode::kDeferred;
   } else if (mode == "none") {
     return ReadbackResolveMode::kDisabled;
   } else {
-    // Default to "fast" for any unrecognized value
+    // Default to "fast" for any unrecognized value. Warn once so a typo (e.g.
+    // "deffered") doesn't silently run a different mode than the one asked for.
+    if (mode != "fast") {
+      static bool unrecognized_warned = false;
+      if (!unrecognized_warned) {
+        unrecognized_warned = true;
+        XELOGW(
+            "Unrecognized readback_resolve value \"{}\", falling back to "
+            "\"fast\" (valid values: fast, full, deferred, none)",
+            mode);
+      }
+    }
     return ReadbackResolveMode::kFast;
   }
 }
@@ -286,7 +341,10 @@ void CommandProcessor::RestoreGammaRamp(
   std::memcpy(gamma_ramp_pwl_rgb_, new_gamma_ramp_pwl_rgb,
               sizeof(reg::DC_LUT_PWL_DATA) * 3 * 128);
   gamma_ramp_rw_component_ = new_gamma_ramp_rw_component;
-  OnGammaRamp256EntryTableValueWritten();
+  // A full 256-entry table is restored atomically here (not via the guest's
+  // incremental register-write sequence), so it's always complete - treat it
+  // like a finished pass.
+  OnGammaRamp256EntryTableValueWritten(true);
   OnGammaRampPWLValueWritten();
 }
 
@@ -569,6 +627,7 @@ void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,
         // Should be in the 256-entry table writing mode.
         assert_zero(regs[XE_GPU_REG_DC_LUT_RW_MODE] & 0b1);
         auto gamma_ramp_rw_index = regs.Get<reg::DC_LUT_RW_INDEX>();
+        LogGammaRampWriteIfNewMax(gamma_ramp_rw_index.rw_index);
         // DC_LUT_SEQ_COLOR is in the red, green, blue order, but the write
         // enable mask is blue, green, red.
         bool write_gamma_ramp_component =
@@ -592,16 +651,18 @@ void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,
               break;
           }
         }
+        bool gamma_ramp_wrapped_to_start = false;
         if (++gamma_ramp_rw_component_ >= 3) {
           gamma_ramp_rw_component_ = 0;
           reg::DC_LUT_RW_INDEX new_gamma_ramp_rw_index = gamma_ramp_rw_index;
           ++new_gamma_ramp_rw_index.rw_index;
+          gamma_ramp_wrapped_to_start = new_gamma_ramp_rw_index.rw_index == 0;
           WriteRegister(
               XE_GPU_REG_DC_LUT_RW_INDEX,
               xe::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
-          OnGammaRamp256EntryTableValueWritten();
+          OnGammaRamp256EntryTableValueWritten(gamma_ramp_wrapped_to_start);
         }
       } break;
 
@@ -648,6 +709,7 @@ void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,
         // Should be in the 256-entry table writing mode.
         assert_zero(regs[XE_GPU_REG_DC_LUT_RW_MODE] & 0b1);
         auto gamma_ramp_rw_index = regs.Get<reg::DC_LUT_RW_INDEX>();
+        LogGammaRampWriteIfNewMax(gamma_ramp_rw_index.rw_index);
         uint32_t gamma_ramp_write_enable_mask =
             regs[XE_GPU_REG_DC_LUT_WRITE_EN_MASK] & 0b111;
         if (gamma_ramp_write_enable_mask) {
@@ -675,7 +737,8 @@ void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,
             XE_GPU_REG_DC_LUT_RW_INDEX,
             xe::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         if (gamma_ramp_write_enable_mask) {
-          OnGammaRamp256EntryTableValueWritten();
+          OnGammaRamp256EntryTableValueWritten(
+              new_gamma_ramp_rw_index.rw_index == 0);
         }
       } break;
     }
@@ -850,6 +913,22 @@ void CommandProcessor::PrepareForWait() {
 }
 
 void CommandProcessor::ReturnFromWait() {}
+
+bool CommandProcessor::ActiveVertexShaderHasMemexport() {
+  Shader* vertex_shader = active_vertex_shader_;
+  if (!vertex_shader) {
+    return false;
+  }
+  // memexport_eM_written() is only meaningful once the microcode has been
+  // analyzed (normally done at draw time). Analysis is idempotent, so ensuring
+  // it here is cheap and is required for draws that would otherwise be dropped
+  // before reaching IssueDraw (where analysis usually happens).
+  if (!vertex_shader->is_ucode_analyzed()) {
+    StringBuffer ucode_disasm_buffer;
+    vertex_shader->AnalyzeUcode(ucode_disasm_buffer);
+  }
+  return vertex_shader->memexport_eM_written() != 0;
+}
 
 void CommandProcessor::InitializeTrace() {
   // Write the initial register values, to be loaded directly into the

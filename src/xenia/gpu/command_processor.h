@@ -39,8 +39,10 @@ enum class GPUSetting { ClearMemoryPageState, ReadbackMemexport };
 
 enum class ReadbackResolveMode {
   kDisabled,  // No readback (none)
-  kFast,      // Delayed sync, 1 frame behind (fast)
-  kFull       // Immediate sync with GPU stall (full)
+  kFast,      // Delayed sync, drained (with a GPU stall) at each fence (fast)
+  kFull,      // Immediate sync with GPU stall per resolve (full)
+  kDeferred   // No per-fence stall: the fence value write is deferred until the
+              // readback's GPU work completes on its own (deferred)
 };
 
 // Occlusion queries - ZPD report mode.
@@ -282,7 +284,16 @@ class CommandProcessor {
   const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const {
     return gamma_ramp_pwl_rgb_[0];
   }
-  virtual void OnGammaRamp256EntryTableValueWritten() {}
+  // wrapped_to_start is true if this write just completed index 255 and the
+  // hardware auto-increment rolled the write index back to 0 - i.e. a full,
+  // complete pass through all 256 entries just finished. The guest writes the
+  // table via 256 sequential register writes; a backend that snapshots/uploads
+  // the table on every single write risks reading it mid-sequence (some
+  // entries freshly written, others stale/unwritten this pass) if that
+  // upload happens to run between two writes. Backends that care about this
+  // race should defer their upload until a write arrives with
+  // wrapped_to_start=true (see D3D12CommandProcessor).
+  virtual void OnGammaRamp256EntryTableValueWritten(bool wrapped_to_start) {}
   virtual void OnGammaRampPWLValueWritten() {}
 
   virtual void MakeCoherent();
@@ -296,6 +307,34 @@ class CommandProcessor {
   virtual uint64_t GetCompletedSubmission() const { return 0; }
 
   virtual void OnPrimaryBufferEnd() {}
+
+  // Called at GPU->CPU synchronization points (a fence/timestamp write to guest
+  // memory via EVENT_WRITE, primary buffer end, swap) right before the guest is
+  // able to observe that the GPU finished the preceding work. Backends that
+  // defer render-target resolve readback to the CPU flush it to guest RAM here,
+  // so the guest never reads stale data. Draining at these choke points instead
+  // of stalling on every resolve batches the GPU stall: any number of resolves
+  // between two fences share a single sync rather than forcing one each.
+  // at_fence_sync distinguishes the per-fence calls (most frequent) from the
+  // coarser primary-buffer-end / swap calls, so a backend can optionally skip
+  // the per-fence drains for fewer stalls. Default: no-op (backends without
+  // deferred readback need nothing here).
+  virtual void FlushReadbacksForGuestVisibility(bool at_fence_sync = false) {}
+
+  // Called by the EVENT_WRITE_SHD fence handler with the host pointer and value
+  // it is about to store as the fence/timestamp the guest polls. A backend may
+  // take ownership of the store - returning true - to delay it until pending
+  // resolve readbacks have actually reached guest RAM, instead of stalling the
+  // command processor now (the "deferred" readback mode). If it returns false
+  // the caller writes the value itself (after the synchronous readback flush the
+  // default performs here). Default: flush synchronously, caller stores - this
+  // preserves the "fast"/"full"/"none" behaviour and is what backends without a
+  // deferred path inherit.
+  virtual bool HandleFenceWriteWithReadback(uint8_t* write_destination,
+                                            uint32_t data_value) {
+    FlushReadbacksForGuestVisibility(/*at_fence_sync=*/true);
+    return false;
+  }
 
   // TODO(boma): Add tracking for EVENT_WRITE_EXT reports.
   using ReportHandle = uint64_t;
@@ -445,6 +484,14 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
+
+  // Ensures the active vertex shader's microcode has been analyzed, then
+  // reports whether it performs memory exports. Used so memexporting draws are
+  // not dropped when they would produce no pixels (e.g. a visibility-query pass
+  // with kill_pix_post_hi_z): the export is a side effect later draws consume,
+  // and dropping it leaves the consumer reading stale data - flickering or
+  // exploding geometry (Fable II's GPU vertex skinning depends on this).
+  bool ActiveVertexShaderHasMemexport();
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

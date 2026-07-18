@@ -479,6 +479,73 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
              dxbc::Src::LF(0.0f));
   }
 
+  // - Optionally sanitize non-finite (NaN/Inf) components
+  //   (kSysFlag_FlushNonfiniteVertexFetch).
+  // Only for genuine float formats - packed/integer formats can legitimately
+  // have the exponent-bits-set pattern. Mitigates meshes fed bad CPU-supplied
+  // float data (e.g. Fable II's dog bone matrices with an Inf column) so the
+  // mesh renders instead of exploding.
+  //
+  // For the 4x4-float transform format (k_32_32_32_32_FLOAT), substitute the
+  // *identity-matrix* value for the fetched row/column rather than 0. Each
+  // vfetch reads one matrix row (a vec4) at a fixed dword offset, so the row
+  // index is known here at translate time (offset / 4 dwords per row); the
+  // identity value for component c is 1.0 when c == row else 0.0. Replacing a
+  // corrupt column with identity (e.g. Fable II's Inf Y-column -> unit Y axis)
+  // keeps the matrix non-degenerate, so the affected bone simply doesn't apply
+  // its bad transform instead of collapsing to a zero column (what flushing to
+  // 0 does, which still visibly glitches). Other float formats keep flush-to-0.
+  bool format_is_float = false;
+  switch (instr.attributes.data_format) {
+    case xenos::VertexFormat::k_16_16_FLOAT:
+    case xenos::VertexFormat::k_16_16_16_16_FLOAT:
+    case xenos::VertexFormat::k_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+    case xenos::VertexFormat::k_32_32_32_FLOAT:
+      format_is_float = true;
+      break;
+    default:
+      break;
+  }
+  // NOTE: a previous revision skipped this sanitize for memexport shaders on the
+  // theory that Fable II's GPU occlusion-culling pass (VS 695413A9831D88DA, which
+  // HAS memexport) reads legitimate +Inf "no bound" sentinels. That REGRESSED the
+  // dog explosion: 695413 memexports the per-object visibility/LOD codes that gate
+  // the dog's geometry, so leaving its Inf threshold inputs unsanitized flips its
+  // comparisons -> wrong codes -> the mesh explodes again. Memexport shaders must
+  // therefore keep the non-finite protection; do NOT re-add a memexport skip here.
+  if (format_is_float && used_format_components) {
+    dxbc::Src substitute = dxbc::Src::LF(0.0f);
+    if (instr.attributes.data_format ==
+            xenos::VertexFormat::k_32_32_32_32_FLOAT &&
+        instr.attributes.offset >= 0) {
+      // Each 4x4 matrix is 4 vec4 rows (4 dwords each). An element may pack
+      // several matrices back to back (Fable II's dog fetches three stacked
+      // 4x4 bone matrices, rows at dword offsets 0,4,8,12,16,...,44), so the
+      // row index within a matrix wraps every 4 rows - otherwise only the
+      // first matrix gets a valid identity and the rest collapse to a zero
+      // column and still explode.
+      int32_t row = (instr.attributes.offset / 4) % 4;
+      substitute = dxbc::Src::LF(row == 0 ? 1.0f : 0.0f, row == 1 ? 1.0f : 0.0f,
+                                 row == 2 ? 1.0f : 0.0f, row == 3 ? 1.0f : 0.0f);
+    }
+    uint32_t flush_temp = PushSystemTemp();
+    a_.OpAnd(dxbc::Dest::R(flush_temp, 0b0001), LoadFlagsSystemConstant(),
+             dxbc::Src::LU(kSysFlag_FlushNonfiniteVertexFetch));
+    a_.OpIf(true, dxbc::Src::R(flush_temp, dxbc::Src::kXXXX));
+    // Non-finite where all exponent bits are set.
+    a_.OpAnd(dxbc::Dest::R(flush_temp, used_format_components),
+             dxbc::Src::R(system_temp_result_), dxbc::Src::LU(0x7F800000));
+    a_.OpIEq(dxbc::Dest::R(flush_temp, used_format_components),
+             dxbc::Src::R(flush_temp), dxbc::Src::LU(0x7F800000));
+    a_.OpMovC(dxbc::Dest::R(system_temp_result_, used_format_components),
+              dxbc::Src::R(flush_temp), substitute,
+              dxbc::Src::R(system_temp_result_));
+    a_.OpEndIf();
+    PopSystemTemp();
+  }
+
   StoreResult(instr.result, dxbc::Src::R(system_temp_result_));
 }
 

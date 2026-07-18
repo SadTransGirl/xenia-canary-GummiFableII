@@ -47,6 +47,7 @@ X_STATUS XMutant::ReleaseMutant(uint32_t priority_increment, bool abandon,
 
   set_priority_increment(priority_increment);
 
+  DbgRecordSignal(4);
   // TODO(benvanik): abandoning.
   assert_false(abandon);
   if (mutant_->Release()) {

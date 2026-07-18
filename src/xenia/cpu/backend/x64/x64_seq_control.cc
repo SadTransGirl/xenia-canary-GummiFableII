@@ -317,9 +317,15 @@ struct CALL_INDIRECT
       if (i.src1.constant() == 0) {
         e.nop();
       } else {
-        // This isn't valid, but at least we will have log info about potential
-        // usecase.
-        e.CallIndirect(i.instr, i.src1);
+        // A constant indirect-call target is unusual (it is normally lowered to
+        // a direct CALL), but it does occur. Materialize the address into a
+        // register first: passing the constant operand straight to
+        // CallIndirect() would invoke ValueOp::reg() on a constant and emit a
+        // call/tail-jump through an undefined register, corrupting the guest
+        // function. CallIndirect only consumes the low 32 bits (reg.cvt32()).
+        Xbyak::Reg64 target = e.GetNativeParam(0);
+        e.mov(target.cvt32(), static_cast<uint32_t>(i.src1.constant()));
+        e.CallIndirect(i.instr, target);
       }
     } else {
       e.CallIndirect(i.instr, i.src1);

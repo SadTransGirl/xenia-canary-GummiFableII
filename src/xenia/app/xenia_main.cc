@@ -128,6 +128,8 @@ DEFINE_transient_bool(portable, true,
 
 DECLARE_bool(debug);
 
+DECLARE_bool(cpu_starvation_mitigation);
+
 DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
 
 DECLARE_int32(window_size_x);
@@ -495,6 +497,18 @@ bool EmulatorApp::OnInitialize() {
   XELOGI("Storage root: {}", storage_root);
 
   config::SetupConfig(storage_root);
+
+  // Optionally raise the emulator's process priority so guest threads keep
+  // getting CPU when the host is busy with other demanding apps - otherwise a
+  // background game can starve the guest logic thread and freeze characters
+  // while audio/GPU (independent threads) keep running.
+  if (cvars::cpu_starvation_mitigation) {
+    if (xe::threading::EnableAboveNormalProcessPriority()) {
+      XELOGI("cpu_starvation_mitigation: raised process priority above normal");
+    } else {
+      XELOGW("cpu_starvation_mitigation: failed to raise process priority");
+    }
+  }
 
 #if XE_ARCH_AMD64 == 1
   amd64::InitFeatureFlags();

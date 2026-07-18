@@ -1002,6 +1002,37 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
 
   dxbc::Src flags_src(LoadFlagsSystemConstant());
 
+  // Optional mitigation (kSysFlag_FlushNonfinitePosition): if the output
+  // position has any non-finite component (NaN or +/-Inf - exponent bits all
+  // set), replace the whole position with the clip-space origin (0, 0, 0, 1).
+  // Geometry fed intermittently-bad transform matrices (e.g. Fable II's dog,
+  // whose CPU-supplied matrices sometimes contain Inf) then collapses to a
+  // point instead of flying off to infinity. Done before the W/divide fix-ups
+  // below so all subsequent math operates on finite values.
+  {
+    a_.OpAnd(temp_x_dest, flags_src,
+             dxbc::Src::LU(kSysFlag_FlushNonfinitePosition));
+    a_.OpIf(true, temp_x_src);
+    // temp = position exponent bits; non-finite where all exponent bits set.
+    a_.OpAnd(dxbc::Dest::R(temp, 0b1111),
+             dxbc::Src::R(system_temp_position_), dxbc::Src::LU(0x7F800000));
+    a_.OpIEq(dxbc::Dest::R(temp, 0b1111), dxbc::Src::R(temp),
+             dxbc::Src::LU(0x7F800000));
+    // OR the four per-component non-finite flags into temp.x.
+    a_.OpOr(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+            dxbc::Src::R(temp, dxbc::Src::kYYYY));
+    a_.OpOr(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+            dxbc::Src::R(temp, dxbc::Src::kZZZZ));
+    a_.OpOr(dxbc::Dest::R(temp, 0b0001), dxbc::Src::R(temp, dxbc::Src::kXXXX),
+            dxbc::Src::R(temp, dxbc::Src::kWWWW));
+    // Where non-finite, select the clip-space origin (0, 0, 0, 1).
+    a_.OpMovC(dxbc::Dest::R(system_temp_position_),
+              dxbc::Src::R(temp, dxbc::Src::kXXXX),
+              dxbc::Src::LF(0.0f, 0.0f, 0.0f, 1.0f),
+              dxbc::Src::R(system_temp_position_));
+    a_.OpEndIf();
+  }
+
   // Check if the shader already returns W, not 1/W, and if it doesn't, turn 1/W
   // into W. Using div rather than relaxed-precision rcp for safety.
   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_WNotReciprocal));

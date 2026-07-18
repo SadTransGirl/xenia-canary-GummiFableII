@@ -1372,7 +1372,8 @@ void VulkanCommandProcessor::SparseBindBuffer(
   sparse_bind_wait_stage_mask_ |= wait_stage_mask;
 }
 
-void VulkanCommandProcessor::OnGammaRamp256EntryTableValueWritten() {
+void VulkanCommandProcessor::OnGammaRamp256EntryTableValueWritten(
+    bool wrapped_to_start) {
   gamma_ramp_256_entry_table_current_frame_ = UINT32_MAX;
 }
 

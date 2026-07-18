@@ -41,6 +41,17 @@
 
 DEFINE_bool(debugprint_trap_log, false,
             "Log debugprint traps to the active debugger", "CPU");
+DEFINE_bool(
+    guard_indirect_call_targets, true,
+    "Skip an indirect guest call instead of crashing when its target isn't a "
+    "plausible guest code address (below 0x10000 - real Xbox 360 code never "
+    "lives there). Observed with Fable II: a combat callback dispatched "
+    "through a degenerate/placeholder function pointer of 1, which "
+    "dereferences as a read at host address 0x1 and hard-crashes the "
+    "emulator. This converts that crash into a silently-skipped call. "
+    "Negligible overhead (one compare+branch per indirect call). On by "
+    "default.",
+    "CPU");
 DEFINE_bool(ignore_undefined_externs, true,
             "Don't exit when an undefined extern is called.", "CPU");
 DEFINE_bool(emit_source_annotations, false,
@@ -71,6 +82,12 @@ namespace x64 {
 using xe::cpu::hir::HIRBuilder;
 using xe::cpu::hir::Instr;
 using namespace xe::literals;
+
+// See declaration in x64_emitter.h. Updated for each instruction before its
+// sequence is selected/emitted so codegen helpers can report context on error.
+thread_local uint32_t x64_current_emit_opcode =
+    static_cast<uint32_t>(hir::OPCODE_NOP);
+thread_local uint32_t x64_current_emit_guest_function = 0;
 
 static constexpr size_t kMaxCodeSize = 1_MiB;
 
@@ -295,6 +312,10 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
           EnsureSynchronizedGuestAndHostStack();
         }
       }
+      // Record diagnostic context so codegen helpers can name the offending
+      // guest opcode/function if a sequence emits incorrectly (see x64_op.h).
+      x64_current_emit_opcode = static_cast<uint32_t>(instr->GetOpcodeNum());
+      x64_current_emit_guest_function = current_guest_function_;
       const Instr* new_tail = instr;
       if (!SelectSequence(this, instr, &new_tail)) {
         // No sequence found!
@@ -748,6 +769,18 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     je(epilog_label(), CodeGenerator::T_NEAR);
   }
 
+  // Guard against a degenerate/corrupt call target (e.g. a null or
+  // placeholder "unimplemented callback" function pointer such as 1) being
+  // dereferenced as code. Real Xbox 360 guest code is never mapped below
+  // 64KB, so a target that low can only be garbage; skip the call instead of
+  // faulting on the indirection-table lookup.
+  const bool guard = cvars::guard_indirect_call_targets;
+  Xbyak::Label skip_call;
+  if (guard) {
+    cmp(reg.cvt32(), 0x10000u);
+    jb(skip_call, CodeGenerator::T_NEAR);
+  }
+
   // Load the pointer to the indirection table maintained in X64CodeCache.
   // The target dword will either contain the address of the generated code
   // or a thunk to ResolveAddress.
@@ -776,12 +809,21 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     add(rsp, static_cast<uint32_t>(stack_size()));
     PopStackpoint();
     jmp(rax);
+    if (guard) {
+      L(skip_call);
+      // A skipped tail call has no "after" in this function - the cleanest
+      // fallback is to return to our own caller, same as an abandoned call.
+      jmp(epilog_label(), CodeGenerator::T_NEAR);
+    }
   } else {
     // Return address is from the previous SET_RETURN_ADDRESS.
     mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
 
     call(rax);
     synchronize_stack_on_next_instruction_ = true;
+    if (guard) {
+      L(skip_call);
+    }
   }
 }
 

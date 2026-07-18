@@ -18,6 +18,16 @@
 #include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
 
+DEFINE_bool(
+    cpu_starvation_mitigation, false,
+    "Keep the game's logic thread running when the host CPU is busy with other "
+    "demanding apps (e.g. another game open). Raises the emulator's process "
+    "priority and makes guest clock-spin loops sleep so the starved thread gets "
+    "CPU. Fixes characters/NPCs freezing while audio and the world keep "
+    "running. Leave off unless you hit that freeze - it raises Xenia's priority "
+    "over other apps.",
+    "CPU");
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
@@ -505,6 +515,38 @@ void KeQuerySystemTime_entry(lpqword_t time_ptr, const ppc_context_t& ctx) {
         &ctx->TranslateVirtual<X_TIME_STAMP_BUNDLE*>(ts_bundle)->system_time,
         time);
     *time_ptr = time;
+  }
+
+  // Guest threads sometimes busy-poll KeQuerySystemTime in a tight loop while
+  // waiting for a deadline or for another thread to publish state (timed waits
+  // are frequently implemented this way). On real hardware such a spinner
+  // shares a Xenon HW thread and is preempted within a timeslice, so the thread
+  // that would satisfy the condition still runs. In Xenia's host-thread model
+  // every guest thread runs truly in parallel, so when the host is
+  // oversubscribed (e.g. another demanding app is running) the non-yielding
+  // spinner can hog a core and starve the very thread that advances game
+  // state - producing a livelock where characters/NPCs freeze while audio and
+  // GPU submission (independent threads) keep running. See the matching yield
+  // in xeKeKfAcquireSpinLock above.
+  //
+  // Throttle: only nudge the scheduler occasionally so threads that call this
+  // at a normal rate are unaffected, while a thread spinning thousands of times
+  // a second yields often. MaybeYield()/Sleep(0) is self-regulating - it only
+  // actually surrenders the timeslice when another thread is waiting for a
+  // core, i.e. exactly the oversubscribed case that triggers the freeze.
+  static thread_local uint32_t query_spin_counter = 0;
+  if ((++query_spin_counter & 0xFF) == 0) {
+    if (cvars::cpu_starvation_mitigation) {
+      // MaybeYield()/Sleep(0) only relinquishes the timeslice to a thread the
+      // OS picks - under cross-process load that can be the other app, not our
+      // starved logic thread. A real (short) sleep removes the spinner from the
+      // runnable set entirely, guaranteeing the freed core is available to
+      // whatever else needs it (the logic thread). 250us is tiny relative to
+      // any timed wait the spinner is implementing.
+      xe::threading::NanoSleep(250000);  // 250 microseconds
+    } else {
+      xe::threading::MaybeYield();
+    }
   }
 }
 DECLARE_XBOXKRNL_EXPORT1(KeQuerySystemTime, kThreading, kImplemented);

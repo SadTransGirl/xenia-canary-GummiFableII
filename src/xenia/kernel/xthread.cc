@@ -30,6 +30,8 @@ DEFINE_bool(ignore_thread_priorities, false,
 UPDATE_from_bool(ignore_thread_priorities, 2026, 4, 9, 12, true);
 DEFINE_bool(ignore_thread_affinities, true,
             "Ignores game-specified thread affinities.", "Kernel");
+// Defined in xboxkrnl_threading.cc.
+DECLARE_bool(cpu_starvation_mitigation);
 
 #if 0
 DEFINE_int64(stack_size_multiplier_hack, 1,
@@ -763,6 +765,51 @@ void XThread::CheckQuantumAndDecay() {
     thread_->set_priority(GuestPriorityToHost(new_priority));
   }
   quantum_start_ms_ = now;
+}
+
+uint32_t XThread::spin_activity_raw() const {
+  return thread_state_ ? thread_state_->context()->spin_activity : 0;
+}
+
+uint32_t XThread::spin_last_lr() const {
+  return thread_state_ ? thread_state_->context()->spin_last_lr32 : 0;
+}
+
+void XThread::UpdateSpinScheduling() {
+  // Without the mitigation enabled, behave exactly as before.
+  if (!cvars::cpu_starvation_mitigation || cvars::ignore_thread_priorities ||
+      !thread_) {
+    CheckQuantumAndDecay();
+    return;
+  }
+  // db16cyc spin-pauses executed by this thread since the last (~20ms) tick.
+  uint32_t cur = thread_state_ ? thread_state_->context()->spin_activity : 0;
+  uint32_t delta = cur - spin_activity_baseline_;
+  spin_activity_baseline_ = cur;
+
+  // A thread doing this many spin-pauses in a single ~20ms quantum is in a
+  // sustained busy-wait that, under host oversubscription, can starve the
+  // game-logic thread (Fable II NPC/character freezes). Demote its host
+  // priority to lowest so the OS scheduler preempts it in favour of any
+  // non-spinning thread - hard preemption instead of hoping a yield lands on
+  // the right thread. Real-time guest threads (>=18) are left alone.
+  constexpr uint32_t kSpinDemoteThreshold = 1000;
+  if (delta >= kSpinDemoteThreshold && priority_ < 18) {
+    if (!spin_demoted_) {
+      spin_demoted_ = true;
+      thread_->set_priority(xe::threading::ThreadPriority::kLowest);
+    }
+    // Pinned to lowest until it stops spinning; skip quantum decay meanwhile.
+    return;
+  }
+  if (spin_demoted_) {
+    // No longer spinning hard - restore the normal guest-mapped host priority
+    // and let decay resume from here.
+    spin_demoted_ = false;
+    thread_->set_priority(GuestPriorityToHost(priority_));
+    quantum_start_ms_ = Clock::QueryHostUptimeMillis();
+  }
+  CheckQuantumAndDecay();
 }
 
 void XThread::BoostOnWake(int32_t increment) {

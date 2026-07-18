@@ -13,6 +13,9 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/string_buffer.h"
+#include "xenia/base/threading.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/user_module.h"
@@ -29,6 +32,25 @@
 #include "xenia/ui/imgui_host_notification.h"
 
 #include "third_party/crypto/TinySHA1.hpp"
+
+DEFINE_bool(
+    deadlock_event_watchdog, false,
+    "Recover from lost-wakeup deadlocks: if a guest thread has been blocked on "
+    "an auto-reset event for over ~3s (a permanent wedge - e.g. Fable II's "
+    "worker-pool freeze where a producer's KeSetEvent raced past the consumer's "
+    "reset/wait and was lost), re-deliver the signal so the worker wakes, finds "
+    "the still-queued work, and the game unfreezes. A spurious wake of a "
+    "legitimately-idle waiter is harmless (it re-checks and waits again).",
+    "Kernel");
+
+DEFINE_bool(
+    log_thread_stall_stats, false,
+    "Diagnostic: once per second, log the global db16cyc spin rate and each "
+    "running guest thread's priority/CPU. Used to diagnose NPC/character "
+    "freezes - during a freeze, a spiking db16cyc rate means a thread is stuck "
+    "in a spin-pause busy-wait; equal-priority runnable threads point to "
+    "scheduler starvation. Verbose; for debugging only.",
+    "Kernel");
 
 DEFINE_bool(apply_title_update, true, "Apply title updates.", "Kernel");
 DEFINE_bool(allow_incompatible_title_update, true,
@@ -1257,7 +1279,165 @@ void KernelState::UpdateKeTimestampBundle() {
     auto global_lock = global_critical_region_.Acquire();
     for (auto& [id, thread] : threads_by_id_) {
       if (thread->is_running()) {
-        thread->CheckQuantumAndDecay();
+        // UpdateSpinScheduling demotes sustained spinners (freeze mitigation)
+        // when cpu_starvation_mitigation is on, else just decays quantum.
+        thread->UpdateSpinScheduling();
+      }
+    }
+  }
+
+  // Deadlock-recovery watchdog: re-deliver lost wakeups to threads wedged on
+  // auto-reset events (see cvar help). Runs ~once/second.
+  if (cvars::deadlock_event_watchdog) {
+    static uint32_t watchdog_counter = 0;
+    if (++watchdog_counter >= 250) {  // ~4x/sec
+      watchdog_counter = 0;
+      uint64_t now_ms = Clock::QueryHostUptimeMillis();
+      auto global_lock = global_critical_region_.Acquire();
+      for (auto& [id, thread] : threads_by_id_) {
+        if (!thread->is_running() || !thread->is_guest_thread()) {
+          continue;
+        }
+        if (thread->dbg_wait_type_.load(std::memory_order_relaxed) != 2 ||
+            !thread->dbg_wait_object_.load(std::memory_order_relaxed)) {
+          continue;
+        }
+        uint64_t start =
+            thread->dbg_wait_start_ms_.load(std::memory_order_relaxed);
+        // 1.5s is far above any normal active wait, so a real wedge recovers
+        // in ~1.5s while legitimately-idle waiters are only rarely nudged.
+        if (!start || (now_ms - start) < 1500) {
+          continue;
+        }
+        XObject* xobj =
+            thread->dbg_wait_xobject_.load(std::memory_order_relaxed);
+        if (xobj && xobj->DbgResetMode() == 1) {  // auto-reset event only
+          XELOGW(
+              "deadlock_event_watchdog: re-signaling event {:08X} for thread "
+              "{:08X} blocked {}ms (lost-wakeup recovery)",
+              xobj->guest_object(), thread->thread_id(), now_ms - start);
+          xobj->WatchdogResignal();
+        }
+      }
+    }
+  }
+
+  // Diagnostic: once per second, dump the db16cyc spin rate and the running
+  // guest threads so a freeze can be classified (spin livelock vs starvation).
+  if (cvars::log_thread_stall_stats) {
+    static uint32_t stall_dump_counter = 0;
+    static uint64_t last_db16cyc = 0;
+    if (++stall_dump_counter >= 1000) {  // ~1s at ~1ms/tick
+      stall_dump_counter = 0;
+      uint64_t now_db16 =
+          xe::threading::g_db16cyc_spin_count.load(std::memory_order_relaxed);
+      XELOGI("STALLSTATS: db16cyc_per_sec={}", now_db16 - last_db16cyc);
+      last_db16cyc = now_db16;
+      uint64_t now_ms_for_stall = Clock::QueryHostUptimeMillis();
+      static std::unordered_map<uint32_t, uint32_t> last_spin_by_id;
+      auto global_lock = global_critical_region_.Acquire();
+      for (auto& [id, thread] : threads_by_id_) {
+        if (thread->is_running() && thread->is_guest_thread()) {
+          uint32_t spin_now = thread->spin_activity_raw();
+          uint32_t spin_rate = spin_now - last_spin_by_id[thread->thread_id()];
+          last_spin_by_id[thread->thread_id()] = spin_now;
+          uint64_t wait_obj =
+              thread->dbg_wait_object_.load(std::memory_order_relaxed);
+          uint64_t wait_ms =
+              wait_obj ? (now_ms_for_stall -
+                          thread->dbg_wait_start_ms_.load(
+                              std::memory_order_relaxed))
+                       : 0;
+          // Last-signal/reset record of the object this thread waits on (safe:
+          // the object is pinned while the thread is blocked on it).
+          struct ObjSig {
+            uint32_t sig_op = 0, sig_tid = 0, rst_tid = 0;
+            int64_t sig_age = -1, rst_age = -1;
+            uint64_t sig_seq = 0, rst_seq = 0;
+            int32_t reset_mode = -1;
+          };
+          auto describe_obj = [&](XObject* xobj) -> ObjSig {
+            ObjSig o;
+            if (!xobj) {
+              return o;
+            }
+            o.sig_op = xobj->dbg_last_signal_op_.load(std::memory_order_relaxed);
+            o.sig_tid =
+                xobj->dbg_last_signal_tid_.load(std::memory_order_relaxed);
+            o.sig_seq =
+                xobj->dbg_last_signal_seq_.load(std::memory_order_relaxed);
+            uint64_t ms =
+                xobj->dbg_last_signal_ms_.load(std::memory_order_relaxed);
+            o.sig_age = ms ? int64_t(now_ms_for_stall - ms) : int64_t(-1);
+            o.rst_tid =
+                xobj->dbg_last_reset_tid_.load(std::memory_order_relaxed);
+            o.rst_seq =
+                xobj->dbg_last_reset_seq_.load(std::memory_order_relaxed);
+            ms = xobj->dbg_last_reset_ms_.load(std::memory_order_relaxed);
+            o.rst_age = ms ? int64_t(now_ms_for_stall - ms) : int64_t(-1);
+            o.reset_mode = xobj->DbgResetMode();
+            return o;
+          };
+          ObjSig o = describe_obj(
+              wait_obj
+                  ? thread->dbg_wait_xobject_.load(std::memory_order_relaxed)
+                  : nullptr);
+          XELOGI(
+              "STALLSTATS thread id={:08X} self_obj={:08X} entry={:08X} prio={} "
+              "cpu={} main={} spin_per_sec={} spin_lr={:08X} demoted={} "
+              "wait_obj={:08X} wait_type={} wait_reason={} wait_ms={} "
+              "reset_mode={} sig_op={} sig_tid={:08X} sig_age_ms={} sig_seq={} "
+              "rst_tid={:08X} rst_age_ms={} rst_seq={} name='{}'",
+              thread->thread_id(), thread->guest_object(),
+              thread->creation_params()->start_address, thread->priority(),
+              thread->active_cpu(), thread->main_thread() ? 1 : 0, spin_rate,
+              thread->spin_last_lr(), thread->spin_demoted() ? 1 : 0,
+              uint32_t(wait_obj),
+              thread->dbg_wait_type_.load(std::memory_order_relaxed),
+              thread->dbg_wait_reason_.load(std::memory_order_relaxed), wait_ms,
+              o.reset_mode, o.sig_op, o.sig_tid, o.sig_age, o.sig_seq, o.rst_tid,
+              o.rst_age, o.rst_seq, thread->name());
+          // For a long-blocked thread, disassemble the worker loop around the
+          // wait site once, so its reset/condition-check/wait protocol can be
+          // read directly. Guest code is big-endian.
+          uint32_t wait_lr = thread->dbg_wait_lr_.load(std::memory_order_relaxed);
+          static std::unordered_set<uint32_t> disasm_dumped_lrs;
+          if (wait_lr && wait_ms > 5000 &&
+              disasm_dumped_lrs.insert(wait_lr).second) {
+            XELOGI("STALLSTATS   --- disasm around wait_lr {:08X} (tid {:08X}) ---",
+                   wait_lr, thread->thread_id());
+            for (uint32_t a = wait_lr - 0x90; a <= wait_lr + 0x08; a += 4) {
+              auto* p = memory_->TranslateVirtual<uint32_t*>(a);
+              if (!p) {
+                continue;
+              }
+              uint32_t code = xe::byte_swap(*p);
+              StringBuffer sb;
+              cpu::ppc::DisasmPPC(a, code, &sb);
+              XELOGI("STALLSTATS   {:08X}: {:08X}  {}", a, code,
+                     sb.to_string_view());
+            }
+          }
+          // For a multi-wait (esp. WaitAll), dump EVERY object of the set -
+          // the blocker is whichever one is unsatisfied.
+          uint32_t multi_count =
+              thread->dbg_wait_multi_count_.load(std::memory_order_acquire);
+          for (uint32_t mi = 0; mi < multi_count && wait_ms > 2000; ++mi) {
+            XObject* mobj =
+                thread->dbg_wait_multi_xobj_[mi].load(std::memory_order_relaxed);
+            ObjSig mo = describe_obj(mobj);
+            XELOGI(
+                "STALLSTATS   multi[{}] obj={:08X} type={} reset_mode={} "
+                "sig_op={} sig_tid={:08X} sig_age_ms={} sig_seq={} "
+                "rst_tid={:08X} rst_age_ms={} rst_seq={}",
+                mi,
+                thread->dbg_wait_multi_addr_[mi].load(
+                    std::memory_order_relaxed),
+                mobj ? uint32_t(mobj->type()) : 0, mo.reset_mode, mo.sig_op,
+                mo.sig_tid, mo.sig_age, mo.sig_seq, mo.rst_tid, mo.rst_age,
+                mo.rst_seq);
+          }
+        }
       }
     }
   }

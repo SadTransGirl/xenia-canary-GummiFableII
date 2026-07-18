@@ -428,6 +428,14 @@ class X64Emitter : public Xbyak::CodeGenerator {
   MXCSRMode mxcsr_mode_ = MXCSRMode::Unknown;
 };
 
+// Diagnostic state for code-generation errors. Recorded per-thread by the
+// instruction-emission loop so deep helpers (e.g. ValueOp::reg) can report
+// which guest HIR opcode and which guest function triggered a bad emit (such
+// as taking the register of an operand that is actually a constant). Stored as
+// plain integers to keep this header include-light.
+extern thread_local uint32_t x64_current_emit_opcode;
+extern thread_local uint32_t x64_current_emit_guest_function;
+
 }  // namespace x64
 }  // namespace backend
 }  // namespace cpu

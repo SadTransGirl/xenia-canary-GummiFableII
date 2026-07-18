@@ -38,6 +38,12 @@ push_const_begin_xe(b0, space0)
     #ifndef XE_RESOLVE_RESOLUTION_SCALED
       uint xe_resolve_dest_base;
     #endif
+    #ifdef XE_RESOLVE_DOWNSAMPLE
+      // 1x (unscaled) guest base of the destination, for downsampling a scaled
+      // resolve result back into the 1x guest memory layout (resolve_downsample
+      // shaders). The scaled source addressing uses dest_base == 0.
+      uint xe_resolve_downsample_dest_base;
+    #endif
   #endif
 push_const_end_xe
 

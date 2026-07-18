@@ -767,8 +767,13 @@ bool PipelineCache::ConfigurePipeline(
   // When enabled, defer shader translation and pipeline creation to background.
   // Only use async when there's a pixel shader - VS-only pipelines are fast
   // to compile and don't benefit from async (vertex shaders are small).
+  // Never use async for memexport draws: the export is a side effect read by
+  // later draws in the same frame. If the pipeline isn't ready, IssueDraw skips
+  // the entire draw - the export doesn't run, and consumer draws read stale
+  // vertices, freezing characters until compilation finishes (Fable II).
   bool use_async = cvars::async_shader_compilation &&
-                   !creation_threads_.empty() && pixel_shader != nullptr;
+                   !creation_threads_.empty() && pixel_shader != nullptr &&
+                   vertex_shader->shader().memexport_eM_written() == 0;
 
   // Ensure VS ucode is analyzed (needed for description hash).
   if (!vertex_shader->shader().is_ucode_analyzed()) {

@@ -195,6 +195,26 @@ class XObject {
   bool is_host_object() const { return host_object_; }
   void set_host_object(bool host_object) { host_object_ = host_object; }
 
+  // Deadlock diagnostics: record of the most recent operations on this object,
+  // read by the log_thread_stall_stats dump. Signals (op 1=Set 2=Pulse
+  // 4=Release) and Resets (op 3) are tracked SEPARATELY - a consumer's
+  // Reset();Wait() pattern would otherwise immediately overwrite the
+  // producer's Set record, hiding who signals the object (seen with Fable II's
+  // event 30072018). Written by XEvent/XSemaphore/XMutant.
+  std::atomic<uint64_t> dbg_last_signal_ms_{0};
+  std::atomic<uint32_t> dbg_last_signal_tid_{0};
+  std::atomic<uint32_t> dbg_last_signal_op_{0};
+  std::atomic<uint64_t> dbg_last_signal_seq_{0};
+  std::atomic<uint64_t> dbg_last_reset_ms_{0};
+  std::atomic<uint32_t> dbg_last_reset_tid_{0};
+  std::atomic<uint64_t> dbg_last_reset_seq_{0};
+  void DbgRecordSignal(uint32_t op);
+  // Overridden by XEvent to report manual(0)/auto(1) reset; -1 if N/A.
+  virtual int32_t DbgResetMode() const { return -1; }
+  // Deadlock-recovery watchdog: re-deliver a lost wakeup to a thread stuck on
+  // this object. Overridden by XEvent (re-Set). Returns true if it signaled.
+  virtual bool WatchdogResignal() { return false; }
+
   template <typename T>
   T* guest_object() {
     return memory()->TranslateVirtual<T*>(guest_object_ptr_);

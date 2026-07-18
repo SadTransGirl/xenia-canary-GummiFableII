@@ -21,6 +21,7 @@
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xsymboliclink.h"
+#include "xenia/base/threading.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
 
@@ -188,6 +189,26 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   }
 }
 
+void XObject::DbgRecordSignal(uint32_t op) {
+  uint64_t now = Clock::QueryHostUptimeMillis();
+  uint64_t seq =
+      xe::threading::g_dispatch_seq.fetch_add(1, std::memory_order_relaxed);
+  uint32_t tid =
+      XThread::IsInThread() ? XThread::GetCurrentThreadId() : 0xFFFFFFFFu;
+  if (op == 3) {
+    // Resets tracked separately so a consumer's Reset();Wait() doesn't erase
+    // the producer's Set record.
+    dbg_last_reset_ms_.store(now, std::memory_order_relaxed);
+    dbg_last_reset_tid_.store(tid, std::memory_order_relaxed);
+    dbg_last_reset_seq_.store(seq, std::memory_order_relaxed);
+    return;
+  }
+  dbg_last_signal_ms_.store(now, std::memory_order_relaxed);
+  dbg_last_signal_tid_.store(tid, std::memory_order_relaxed);
+  dbg_last_signal_op_.store(op, std::memory_order_relaxed);
+  dbg_last_signal_seq_.store(seq, std::memory_order_relaxed);
+}
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                        uint32_t alertable, uint64_t* opt_timeout) {
   auto wait_handle = GetWaitHandle();
@@ -201,8 +222,31 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  // Deadlock diagnostics: record what this thread is blocking on so a freeze
+  // capture (log_thread_stall_stats) shows every thread's wait object and the
+  // never-signaled one can be found. Only meaningful for infinite waits, but
+  // recorded for all; cleared on wake.
+  XThread* wait_self = XThread::GetCurrentThread();
+  if (wait_self) {
+    wait_self->dbg_wait_object_.store(guest_object(), std::memory_order_relaxed);
+    wait_self->dbg_wait_type_.store(static_cast<uint32_t>(type()),
+                                    std::memory_order_relaxed);
+    wait_self->dbg_wait_reason_.store(wait_reason, std::memory_order_relaxed);
+    wait_self->dbg_wait_start_ms_.store(Clock::QueryHostUptimeMillis(),
+                                        std::memory_order_relaxed);
+    wait_self->dbg_wait_xobject_.store(this, std::memory_order_relaxed);
+    if (wait_self->thread_state()) {
+      wait_self->dbg_wait_lr_.store(
+          uint32_t(wait_self->thread_state()->context()->lr),
+          std::memory_order_relaxed);
+    }
+  }
   auto result =
       xe::threading::Wait(wait_handle, alertable ? true : false, timeout_ms);
+  if (wait_self) {
+    wait_self->dbg_wait_xobject_.store(nullptr, std::memory_order_relaxed);
+    wait_self->dbg_wait_object_.store(0, std::memory_order_relaxed);
+  }
 
   switch (result) {
     case xe::threading::WaitResult::kSuccess:
@@ -278,6 +322,34 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  // Deadlock diagnostics: record the first object as a representative of this
+  // multi-wait (log_thread_stall_stats). Cleared after the wait returns.
+  XThread* wait_self = XThread::GetCurrentThread();
+  if (wait_self && count) {
+    wait_self->dbg_wait_object_.store(objects[0]->guest_object(),
+                                      std::memory_order_relaxed);
+    wait_self->dbg_wait_type_.store(static_cast<uint32_t>(objects[0]->type()),
+                                    std::memory_order_relaxed);
+    // Flag a multi-wait with 0x1000; 0x2000 = wait-ALL (wait_type == 0), where
+    // the blocker is whichever object of the set is unsatisfied.
+    wait_self->dbg_wait_reason_.store(
+        wait_reason | 0x1000 | (wait_type ? 0 : 0x2000),
+        std::memory_order_relaxed);
+    wait_self->dbg_wait_start_ms_.store(Clock::QueryHostUptimeMillis(),
+                                        std::memory_order_relaxed);
+    wait_self->dbg_wait_xobject_.store(objects[0], std::memory_order_relaxed);
+    uint32_t multi_count =
+        std::min(count, XThread::kDbgMaxMultiWait);
+    for (uint32_t i = 0; i < multi_count; ++i) {
+      wait_self->dbg_wait_multi_addr_[i].store(objects[i]->guest_object(),
+                                               std::memory_order_relaxed);
+      wait_self->dbg_wait_multi_xobj_[i].store(objects[i],
+                                               std::memory_order_relaxed);
+    }
+    wait_self->dbg_wait_multi_count_.store(multi_count,
+                                           std::memory_order_release);
+  }
+
   X_STATUS status;
   uint32_t boost_increment = 0;
   if (wait_type) {
@@ -331,6 +403,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
         status = X_STATUS_ABANDONED_WAIT_0;
         break;
     }
+  }
+
+  if (wait_self) {
+    wait_self->dbg_wait_multi_count_.store(0, std::memory_order_relaxed);
+    wait_self->dbg_wait_xobject_.store(nullptr, std::memory_order_relaxed);
+    wait_self->dbg_wait_object_.store(0, std::memory_order_relaxed);
   }
 
   // Apply priority boost if the thread actually blocked (not on

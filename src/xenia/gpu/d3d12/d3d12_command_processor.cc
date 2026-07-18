@@ -8,13 +8,22 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_set>
+#include <vector>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
@@ -25,7 +34,16 @@
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/gpu/xenos_zpd_report.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xthread.h"
+#include "xenia/memory.h"
+#include "xenia/xbox.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -39,7 +57,239 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "possible to submit immediately to try to reduce frame latency.",
             "D3D12");
 
+DEFINE_bool(
+    readback_resolve_8888_only, false,
+    "When CPU readback of render-to-texture resolves is enabled "
+    "(readback_resolve is not \"none\"), only read back k_8_8_8_8 color "
+    "resolves. This is one of the formats Fable II uses for texture morphs that "
+    "need CPU data; restricting to it avoids the cost of reading back resolves "
+    "in other formats that the game never reads on the CPU. NOTE: this excludes "
+    "Fable II's k_1_5_5_5 character-body morphs - prefer "
+    "readback_resolve_morph_formats_only for Fable II. Leave off if another "
+    "game needs a different resolved format on the CPU.",
+    "GPU");
+
+DEFINE_bool(
+    readback_resolve_morph_formats_only, false,
+    "When CPU readback of render-to-texture resolves is enabled "
+    "(readback_resolve is not \"none\"), only read back resolves whose "
+    "destination format is k_8_8_8_8 or k_1_5_5_5 - the two formats Fable II's "
+    "CPU texture morphs (dog = k_8_8_8_8, character body = k_1_5_5_5) use. The "
+    "game renders many other resolves (k_2_10_10_10, k_16_16_16_16_FLOAT, etc.) "
+    "that the CPU never reads; reading them back is pure cost - a copy plus a "
+    "GPU sync stall at the next fence. Restricting to the morph formats skips "
+    "the majority of readbacks (in a Fable II capture ~57% were non-morph "
+    "formats). Leave off for other games unless you know their CPU-read "
+    "resolve format. Combine with readback_resolve_max_length to also drop "
+    "full-screen k_8_8_8_8 resolves that aren't morphs.",
+    "GPU");
+
+DEFINE_bool(
+    readback_resolve_drain_on_fence, true,
+    "Deliver deferred resolve readbacks to guest RAM at every GPU fence write "
+    "(EVENT_WRITE), in addition to primary-buffer end and swap. This is the "
+    "safe default: the guest cannot observe a fence (and thus cannot read the "
+    "resolved data) until the readback has landed. Setting this false drains "
+    "ONLY at primary-buffer end and swap, which means far fewer GPU sync stalls "
+    "(higher framerate) but risks stale/black readback if a game reads resolved "
+    "data mid-command-buffer right after a fence. Try false for more "
+    "performance; if morph textures flicker or go black, set it back to true.",
+    "GPU");
+
+DEFINE_bool(
+    readback_resolve_deferred_lazy, false,
+    "In \"deferred\" readback mode, never block the command processor at "
+    "primary-buffer-end or swap to deliver resolve readbacks. Readbacks "
+    "recorded since the last guest fence are instead attached to a valueless "
+    "deferred fence and delivered when their GPU submission completes on its "
+    "own, like fence-gated readbacks already are. The guest still never "
+    "observes a fence value before the readback data is in RAM (correctness "
+    "unchanged); the emulator just stops waiting for the GPU eagerly, keeping "
+    "CPU/GPU overlap - measured as the dominant remaining readback stall in "
+    "Fable II at high resolution scale. The command-processor-idle path stays "
+    "blocking, so a guest busy-waiting on a fence always makes progress. Try "
+    "true for more performance; if morph textures go stale/black, set back to "
+    "false. Only affects readback_resolve = \"deferred\" on Direct3D 12.",
+    "GPU");
+
+DEFINE_string(
+    readback_resolve_only_dest_bases, "",
+    "When CPU readback of render-to-texture resolves is enabled "
+    "(readback_resolve is not \"none\"), only read back resolves whose "
+    "RB_COPY_DEST_BASE (the guest destination base address of the resolve) "
+    "matches one of these comma-separated entries - each a single address or "
+    "an inclusive lo-hi range (hex with 0x or decimal, e.g. "
+    "\"0x12700000-0x127fffff,0x12d00000-0x12dfffff\"); empty = no restriction. "
+    "This is the most aggressive readback filter and "
+    "the one that recovers the most framerate: Fable II resolves the CPU-read "
+    "morph textures to a small set of fixed base addresses, so matching only "
+    "those reads back about one resolve per frame instead of the ten-to-forty "
+    "the format and size filters still pass - the remaining readback stall is "
+    "the game blocking on each resolve fence, so cutting their count is what "
+    "closes it (this is how the Fable II femtofork gets its higher framerate; "
+    "it uses a single address, 0x12704000, but that only covers the character "
+    "morph - the dog resolves to a different base, so list both). AND-combined "
+    "with the other readback filters, so when set it dominates. Game- and "
+    "version-specific: if a morph goes black or stops updating, its base is not "
+    "in the list - find it with log_resolve_readback (the dest_base= field) or "
+    "clear this. Leave empty for other games.",
+    "GPU");
+
+DEFINE_uint64(
+    readback_resolve_max_length, 0,
+    "When CPU readback of render-to-texture resolves is enabled "
+    "(readback_resolve is not \"none\"), skip reading back any color resolve "
+    "whose destination is larger than this many bytes (0 = no limit). Games "
+    "that read resolves on the CPU only do so for small textures (e.g. Fable "
+    "II's character/dog morph textures); large full-screen resolves (the scene, "
+    "shadows, post-processing) are never read by the CPU, so reading them back "
+    "is pure cost - it copies megabytes per frame and, worse, keeps a readback "
+    "pending at almost every fence, forcing a GPU sync stall at each. Capping "
+    "the size leaves only the small CPU-read resolves pending, so most fences "
+    "stall-free. Use log_resolve_readback to find the size of the textures a "
+    "game actually needs, then set this just above it (e.g. 2097152 for 2 MiB). "
+    "Too low and a needed readback is skipped (its texture goes stale/black).",
+    "GPU");
+
+DEFINE_bool(
+    gpu_flush_nonfinite_vertex, false,
+    "Replace any non-finite (NaN/Inf) vertex shader output position with the "
+    "clip-space origin. Superseded by gpu_flush_nonfinite_vertex_fetch (which "
+    "fixes the bad input instead of collapsing the output, avoiding stray "
+    "triangles); leave this off. Off by default.",
+    "GPU");
+
+DEFINE_bool(
+    gpu_flush_nonfinite_vertex_fetch, false,
+    "Sanitize non-finite (NaN/Inf) components of fetched float vertex "
+    "attributes. Mitigation for meshes fed bad CPU-supplied float data - e.g. "
+    "Fable II's dog, whose bone matrices intermittently contain an Inf column. "
+    "For the 4x4-float transform format the corrupt component is replaced with "
+    "the identity-matrix value for that row/column (so an Inf Y-column becomes "
+    "a unit Y axis and the matrix stays non-degenerate - the affected bone just "
+    "doesn't apply its bad transform); other float formats are flushed to 0. "
+    "The dog then renders finite and flicker-free instead of exploding. Does "
+    "not fix the underlying bad data (a CPU-side issue). Changes shader codegen "
+    "- clear the shader cache (or let shaders retranslate) after toggling. Off "
+    "by default.",
+    "GPU");
+
+DEFINE_bool(
+    log_resolve_readback, false,
+    "Log every render-to-texture resolve that is a candidate for CPU readback "
+    "(address, length, color/depth source, destination format, and whether "
+    "readback was actually performed). Diagnostic for textures that read back "
+    "incorrectly - compare the lines for a working vs. a broken object.",
+    "GPU");
+
 DECLARE_bool(clear_memory_page_state);
+// Defined in draw_util.cc - non-finite vertex data diagnostics/mitigation.
+DECLARE_bool(log_nonfinite_draws);
+DECLARE_bool(skip_nonfinite_draws);
+
+DEFINE_string(
+    debug_skip_vs_hash, "",
+    "Debug: skip (don't draw) any draw whose vertex shader ucode hash matches "
+    "this 16-hex-digit value (e.g. 29B6506FBACEB93A). Used to visually isolate "
+    "which draw produces an artifact - if the artifact disappears when a hash "
+    "is skipped, that draw is the culprit. Empty = skip nothing. Multiple "
+    "hashes may be given separated by commas. For debugging only.",
+    "GPU");
+
+DEFINE_string(
+    debug_skip_ps_hash, "",
+    "Debug: like debug_skip_vs_hash, but matches the PIXEL shader ucode "
+    "hash instead. Useful when multiple pixel shaders share one vertex "
+    "shader (e.g. a simple screen-quad transform reused for several sprite "
+    "layers) and only one of them needs to be isolated. Comma-separated "
+    "16-hex-digit hashes. For debugging only.",
+    "GPU");
+
+DEFINE_string(
+    skip_vs_hash_if_nonfinite, "",
+    "Skip a draw whose vertex shader ucode hash matches this 16-hex-digit "
+    "value (comma-separated list) ONLY on frames where its guest vertex data "
+    "is garbage (non-finite or absurdly huge). Unlike skip_nonfinite_draws "
+    "this also applies to memexport shaders and is scoped to the listed "
+    "hashes, so the draw renders normally when its data is good and only "
+    "vanishes on the bad frames instead of exploding - e.g. Fable II's "
+    "redundant dog draw 7C5710DEF3EE33C4, whose skinned positions come out "
+    "huge-finite on ~15% of frames and every area change.",
+    "GPU");
+
+DEFINE_bool(
+    gpu_clamp_fp10_edram_output, false,
+    "On the host-render-target (RTV) path, clamp pixel shader color output for "
+    "k_2_10_10_10_FLOAT (7e3) render targets to the console-representable range "
+    "([0, 31.875] RGB, [0, 1] alpha). The float16 host resource backing an FP10 "
+    "target does not clamp to the 7e3 range the way console EDRAM / the ROV "
+    "path does, so bright additive HDR content can accumulate past 31.875 and "
+    "blow out after the game's tonemap (Fable II moon halo hard-disc bug). "
+    "Runtime-toggleable (system-constant flag, no shader-cache clear). "
+    "Experimental; off by default.",
+    "GPU");
+
+DEFINE_bool(
+    gpu_sanitize_nonfinite_constants, false,
+    "Replace non-finite (NaN/Inf) float shader constants with 0 when uploading "
+    "them to the GPU. Mitigation for effects fed a bad CPU-computed constant - "
+    "e.g. Fable II's translucent 'moon lighting' sheets, whose pixel shader "
+    "reads c47.x = +Inf on ~15% of frames and blows up its shading. Only "
+    "touches values that are already non-finite, so legitimate constants are "
+    "untouched. Does not fix the underlying bad data (a CPU-side issue). "
+    "Off by default.",
+    "GPU");
+
+DEFINE_bool(
+    log_additive_draws, false,
+    "Log the VS/PS hashes of every translucent draw using additive-style "
+    "blending (dest factor One/InvSrcAlpha with src One/SrcAlpha), deduped "
+    "per shader pair. Glow/halo effects (e.g. Fable II's moon halo) are "
+    "almost always additive, unlike ordinary alpha-blended world geometry - "
+    "this narrows a large translucent-draw candidate list down to just the "
+    "effect layer. For debugging only.",
+    "GPU");
+
+DEFINE_bool(
+    log_nonfinite_constants, false,
+    "Log any draw whose USED float shader constants contain a non-finite "
+    "(NaN/Inf) or absurdly huge (|value| >= 1e6) value, with the vertex and "
+    "pixel shader hashes and the offending constant register/component. "
+    "Diagnostic for geometry that stretches/explodes because of a bad "
+    "transform or light-position CONSTANT (as opposed to bad vertex data, "
+    "which log_nonfinite_draws covers) - e.g. Fable II's flickering "
+    "translucent 'moon lighting' sheets. Very verbose; for debugging only. "
+    "Off by default.",
+    "GPU");
+
+DEFINE_bool(
+    trace_nonfinite_matrix_writer, false,
+    "Diagnostic: when a draw is found with non-finite (Inf/NaN) float vertex/"
+    "transform data, watch that memory page and, on the next guest CPU write to "
+    "it, log the writing guest thread's link register and PowerPC call stack. "
+    "Used to find the game code that computes the bad (Inf) bone matrices that "
+    "explode Fable II's dog. Very verbose; for debugging only. Off by default.",
+    "GPU");
+
+DEFINE_bool(
+    log_halo_texture_fetch, false,
+    "Log the tf13 texture fetch constant (address, size, format, mip levels, "
+    "and U/V/W clamp/address modes) for the Fable II moon halo pixel shader "
+    "04985A0F7296E130 each time the bound texture or clamp mode changes. Used "
+    "to check whether the glow sprite is sampled with Wrap addressing (which "
+    "tiles/seams at the sprite edges) or served the wrong texture. For "
+    "debugging only. Off by default.",
+    "GPU");
+
+DEFINE_bool(
+    log_ps_c31_writes, false,
+    "Log every guest write to pixel shader float constant register c31 (value "
+    "+ component), and the value actually copied into the GPU constant buffer "
+    "whenever a draw's pixel shader uses c31. Used to determine whether Fable "
+    "II's moon halo hard-edge bug is caused by the guest CPU computing a wrong "
+    "tint value for c31, or by Xenia serving a stale cached upload. Very "
+    "verbose; for debugging only. Off by default.",
+    "GPU");
 
 namespace xe {
 namespace gpu {
@@ -786,6 +1036,12 @@ bool D3D12CommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) {
     XELOGE("Failed to initialize base command processor context");
     return false;
+  }
+
+  if (cvars::trace_nonfinite_matrix_writer) {
+    nonfinite_writer_callback_handle_ =
+        memory_->RegisterPhysicalMemoryInvalidationCallback(
+            NonfiniteWriterCallbackThunk, this);
   }
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -1579,9 +1835,37 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
 
+  if (nonfinite_writer_callback_handle_) {
+    memory_->UnregisterPhysicalMemoryInvalidationCallback(
+        nonfinite_writer_callback_handle_);
+    nonfinite_writer_callback_handle_ = nullptr;
+  }
+  uint8_t* source_watch_host_base =
+      nonfinite_source_host_base_.exchange(nullptr, std::memory_order_acq_rel);
+  if (source_watch_host_base) {
+    xe::memory::Protect(source_watch_host_base, 0x1000u,
+                        memory::PageAccess::kReadWrite, nullptr);
+  }
+  nonfinite_source_watch_window_.store(nullptr, std::memory_order_release);
+  if (nonfinite_source_handler_installed_) {
+    ExceptionHandler::Uninstall(NonfiniteSourceWatchHandlerThunk, this);
+    nonfinite_source_handler_installed_ = false;
+  }
+
+  // Deliver any deferred resolve readbacks before tearing down their buffers.
+  // Drain the deferred fences explicitly first: in lazy deferred mode the
+  // flush below would re-defer instead of delivering, and clearing the deque
+  // then would drop guest-visible fence values. Blocking is instant here - the
+  // await above guarantees the GPU copies are done.
+  TryCompleteDeferredFences(/*block=*/true);
+  readback_flush_at_shutdown_ = true;
+  FlushReadbacksForGuestVisibility(/*at_fence_sync=*/false);
+  readback_flush_at_shutdown_ = false;
+  deferred_fences_.clear();
   for (auto& pair : readback_buffers_) {
-    ui::d3d12::util::ReleaseAndNull(pair.second.buffers[0]);
-    ui::d3d12::util::ReleaseAndNull(pair.second.buffers[1]);
+    for (uint32_t i = 0; i < kReadbackRingSize; ++i) {
+      ui::d3d12::util::ReleaseAndNull(pair.second.buffers[i]);
+    }
   }
   readback_buffers_.clear();
 
@@ -1734,6 +2018,18 @@ void D3D12CommandProcessor::WriteRegisterForceinline(uint32_t index,
         if (float_constant_index >= 256) {
           float_constant_index =
               static_cast<unsigned char>(float_constant_index);
+          if (cvars::log_ps_c31_writes && float_constant_index == 31) {
+            uint32_t component =
+                (index - XE_GPU_REG_SHADER_CONSTANT_000_X) & 3;
+            float value_f;
+            std::memcpy(&value_f, &value, sizeof(value_f));
+            XELOGW(
+                "PS c31 write: comp={} value=0x{:08X} ({}) "
+                "currently_tracked_by_bound_shader={}",
+                component, value, value_f,
+                (current_float_constant_map_pixel_[31 >> 6] &
+                 (uint64_t(1) << 31)) != 0);
+          }
           if (current_float_constant_map_pixel_[float_constant_index >> 6] &
               float_constant_mask) {  // take advantage of x86
                                       // modulus shift
@@ -1938,19 +2234,26 @@ void D3D12CommandProcessor::WriteShaderConstantsFromMem(
       uint32_t end_map_index =
           (start_index + num_registers - XE_GPU_REG_SHADER_CONSTANT_000_X) / 4;
 
-      if (map_index < 256 && cbuffer_vertex_uptodate) {
-        for (; map_index < end_map_index; ++map_index) {
-          if (current_float_constant_map_vertex_[map_index >> 6] &
-              (1ull << map_index)) {
+      // Vertex (0-255) and pixel (256-511) halves use independent cursors,
+      // each clamped to its own half - a write range that spans the 256
+      // boundary in one packet must not let one loop's cursor bleed into
+      // (or skip) the other's range, which previously caused an out-of-
+      // bounds current_float_constant_map_vertex_ read and could leave
+      // cbuffer_binding_float_pixel_ wrongly marked up-to-date (a changed
+      // pixel constant silently not invalidated, serving a stale upload).
+      if (cbuffer_vertex_uptodate && map_index < 256) {
+        uint32_t vertex_end = std::min<uint32_t>(end_map_index, 256);
+        for (uint32_t i = map_index; i < vertex_end; ++i) {
+          if (current_float_constant_map_vertex_[i >> 6] & (1ull << i)) {
             cbuffer_vertex_uptodate = false;
             break;
           }
         }
       }
-      if (end_map_index > 256 && cbuffer_pixel_uptodate) {
-        for (; map_index < end_map_index; ++map_index) {
-          uint32_t float_constant_index = map_index;
-          float_constant_index -= 256;
+      if (cbuffer_pixel_uptodate && end_map_index > 256) {
+        uint32_t pixel_start = std::max<uint32_t>(map_index, 256);
+        for (uint32_t i = pixel_start; i < end_map_index; ++i) {
+          uint32_t float_constant_index = i - 256;
           if (current_float_constant_map_pixel_[float_constant_index >> 6] &
               (1ull << float_constant_index)) {
             cbuffer_pixel_uptodate = false;
@@ -2123,8 +2426,17 @@ void D3D12CommandProcessor::WriteOneRegisterFromRing(uint32_t base,
   }
   reader_.EndRead(read);
 }
-void D3D12CommandProcessor::OnGammaRamp256EntryTableValueWritten() {
+void D3D12CommandProcessor::OnGammaRamp256EntryTableValueWritten(
+    bool wrapped_to_start) {
   gamma_ramp_256_entry_table_up_to_date_ = false;
+  if (wrapped_to_start) {
+    // A full 256-entry pass just completed - safe to upload.
+    gamma_ramp_256_entry_table_write_in_progress_ = false;
+  } else if (!gamma_ramp_256_entry_table_write_in_progress_) {
+    gamma_ramp_256_entry_table_write_in_progress_ = true;
+    gamma_ramp_256_entry_table_write_started_ms_ =
+        Clock::QueryHostUptimeMillis();
+  }
 }
 
 void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
@@ -2140,6 +2452,39 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   if (!presenter) {
     return;
   }
+
+  // Per-frame readback instrumentation (one line per frame). The stall time is
+  // the wall-clock the command processor spent draining the GPU to idle to
+  // deliver readbacks this frame - the number that shows whether the resolve
+  // path is the framerate bottleneck. "fast" stalls at each fence; "deferred"
+  // should show far fewer/zero fence stalls.
+  if (cvars::log_resolve_readback) {
+    XELOGI(
+        "Readback frame: copied={} fence_stalls={} deferred_delivered={} "
+        "stall={}us (fence={} bufend={} swap={} idle={} ring={}) "
+        "deferred_still_pending={}",
+        readback_frame_resolves_copied_, readback_frame_fence_stalls_,
+        readback_frame_deferred_delivered_, readback_frame_stall_ns_ / 1000,
+        readback_frame_stall_site_ns_[kReadbackStallSiteFence] / 1000,
+        readback_frame_stall_site_ns_[kReadbackStallSiteBufferEnd] / 1000,
+        readback_frame_stall_site_ns_[kReadbackStallSiteSwap] / 1000,
+        readback_frame_stall_site_ns_[kReadbackStallSiteIdle] / 1000,
+        readback_frame_stall_site_ns_[kReadbackStallSiteRingGuard] / 1000,
+        uint32_t(deferred_fences_.size()));
+  }
+  readback_frame_resolves_copied_ = 0;
+  readback_frame_fence_stalls_ = 0;
+  readback_frame_deferred_delivered_ = 0;
+  readback_frame_stall_ns_ = 0;
+  std::memset(readback_frame_stall_site_ns_, 0,
+              sizeof(readback_frame_stall_site_ns_));
+
+  // Deliver any deferred resolve readbacks before presenting - the guest treats
+  // the swap as a frame boundary and may read resolved data right after it.
+  // Done before BeginSubmission since the flush ends the current submission;
+  // BeginSubmission below then opens a fresh one for the swap commands.
+  readback_stall_site_ = kReadbackStallSiteSwap;
+  FlushReadbacksForGuestVisibility(/*at_fence_sync=*/false);
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
@@ -2232,8 +2577,24 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
         // multiple times per frame).
+        // For the 256-entry table, avoid uploading while the guest's write
+        // sequence (256 sequential register writes) looks mid-flight - doing
+        // so can capture a half-written table (some entries fresh, others
+        // stale/zero), producing a wrong, hard-edged result downstream. Wait
+        // for a full pass to complete (OnGammaRamp256EntryTableValueWritten
+        // clears the in-progress flag on wrap), with a bounded timeout so a
+        // genuine partial/non-wrapping update from the guest still eventually
+        // gets applied instead of being deferred forever.
+        constexpr uint64_t kGammaRampTableWriteTimeoutMs = 100;
+        bool gamma_ramp_table_upload_deferred =
+            !use_pwl_gamma_ramp &&
+            gamma_ramp_256_entry_table_write_in_progress_ &&
+            (Clock::QueryHostUptimeMillis() -
+             gamma_ramp_256_entry_table_write_started_ms_) <
+                kGammaRampTableWriteTimeoutMs;
         if (!(use_pwl_gamma_ramp ? gamma_ramp_pwl_up_to_date_
-                                 : gamma_ramp_256_entry_table_up_to_date_)) {
+                                 : gamma_ramp_256_entry_table_up_to_date_) &&
+            !gamma_ramp_table_upload_deferred) {
           uint32_t gamma_ramp_offset_bytes = use_pwl_gamma_ramp ? 256 * 4 : 0;
           uint32_t gamma_ramp_upload_offset_bytes =
               uint32_t(frame_current_ % kQueueFrames) * ((256 + 128 * 3) * 4) +
@@ -2483,6 +2844,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+  // The guest is about to be released to inspect GPU results; deliver any
+  // deferred resolve readbacks to guest RAM first (catch-all for reads that
+  // happen after the primary buffer rather than after a specific fence).
+  readback_stall_site_ = kReadbackStallSiteBufferEnd;
+  FlushReadbacksForGuestVisibility(/*at_fence_sync=*/false);
+
   // Pump any completed resolves now since the guest is likely about to poll.
   PumpQueryResolves();
   PumpPendingRetire();
@@ -2498,6 +2865,32 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
                                           const uint32_t* host_address,
                                           uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+}
+
+// Returns true if vs_hash matches any of the comma-separated 16-hex-digit
+// vertex shader ucode hashes in list (used by debug_skip_vs_hash and
+// skip_vs_hash_if_nonfinite).
+static bool VsHashInList(const std::string& list, uint64_t vs_hash) {
+  size_t pos = 0;
+  while (pos < list.size()) {
+    size_t comma = list.find(',', pos);
+    size_t token_end = (comma == std::string::npos) ? list.size() : comma;
+    size_t b = list.find_first_not_of(" \t", pos);
+    if (b != std::string::npos && b < token_end) {
+      size_t e = list.find_last_not_of(" \t", token_end - 1);
+      uint64_t h = 0;
+      auto [ptr, ec] =
+          std::from_chars(list.data() + b, list.data() + e + 1, h, 16);
+      if (ec == std::errc() && h == vs_hash) {
+        return true;
+      }
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return false;
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
@@ -2532,6 +2925,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
 
+  // Debug: skip draws by vertex shader hash to visually isolate an artifact.
+  if (!cvars::debug_skip_vs_hash.empty() &&
+      VsHashInList(cvars::debug_skip_vs_hash,
+                   vertex_shader->ucode_data_hash())) {
+    return true;
+  }
+
+  // Diagnostic (no-op unless log_vertex_fetch_constants is enabled): dump this
+  // draw's vertex fetch layout and the first few vertices' values so a
+  // memexport consumer can be matched against the exported stream when
+  // debugging corrupt skinned geometry.
+  draw_util::LogVertexFetchConstants(*memory_, regs, *vertex_shader);
+
   const bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   // Pixel shader analysis.
@@ -2561,9 +2967,256 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
   }
 
+  // Debug: skip draws by pixel shader hash, for isolating one PS variant
+  // among several sharing the same vertex shader.
+  if (pixel_shader && !cvars::debug_skip_ps_hash.empty() &&
+      VsHashInList(cvars::debug_skip_ps_hash,
+                   pixel_shader->ucode_data_hash())) {
+    return true;
+  }
+
+  // Diagnostic: dump the tf13 texture fetch constant for the Fable II moon
+  // halo pixel shader (04985A0F7296E130 = sample(tf13) * c31). Confirms the
+  // bound glow-sprite texture (address/size/format/mips) and, crucially, its
+  // U/V/W clamp (address) modes - a glow sprite sampled with Wrap instead of
+  // Clamp tiles/seams at the quad edges, a candidate for the hard-edged halo.
+  if (cvars::log_halo_texture_fetch && pixel_shader &&
+      pixel_shader->ucode_data_hash() == 0x04985A0F7296E130ull) {
+    static uint64_t last_halo_fetch_key = ~0ull;
+    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(13);
+    uint64_t key = (uint64_t(fetch.base_address) << 32) ^
+                   (uint64_t(fetch.dword_1)) ^
+                   (uint64_t(fetch.dword_2) << 12) ^
+                   (uint64_t(uint32_t(fetch.clamp_x)) << 3) ^
+                   (uint64_t(uint32_t(fetch.clamp_y)) << 6);
+    if (key != last_halo_fetch_key) {
+      last_halo_fetch_key = key;
+      XELOGW(
+          "Halo tf13: base=0x{:08X} {}x{} fmt={} dim={} tiled={} "
+          "mip_min={} mip_max={} clamp_x={} clamp_y={} clamp_z={}",
+          fetch.base_address << 12, fetch.size_2d.width + 1,
+          fetch.size_2d.height + 1, uint32_t(fetch.format),
+          uint32_t(fetch.dimension), uint32_t(fetch.tiled),
+          uint32_t(fetch.mip_min_level), uint32_t(fetch.mip_max_level),
+          uint32_t(fetch.clamp_x), uint32_t(fetch.clamp_y),
+          uint32_t(fetch.clamp_z));
+    }
+  }
+
+  // Halo RENDER TARGET diagnostic: log the bound color RT format(s), the color
+  // write mask, and RT0 blend factors for the moon halo draw. This settles the
+  // open question of why gpu_clamp_fp10_edram_output does not fix the halo: if
+  // the written RT's color_format is k_2_10_10_10_FLOAT (3, FP10 7e3) the clamp
+  // machinery applies and something downstream is still wrong; if it is
+  // k_16_16_16_16_FLOAT (7, true float16 HDR) NONE of the FP10 clamp code (the
+  // UNORM format switch or the 1/31.875 scaling flag) ever touches it, so the
+  // additive blend accumulates unbounded regardless of the cvar - which would
+  // mean the fix was aimed at the wrong format.
+  if (cvars::log_halo_texture_fetch && pixel_shader &&
+      pixel_shader->ucode_data_hash() == 0x04985A0F7296E130ull) {
+    static uint64_t last_halo_rt_key = ~0ull;
+    auto mode_control = regs.Get<reg::RB_MODECONTROL>();
+    auto color_mask = regs.Get<reg::RB_COLOR_MASK>();
+    auto blend0 = regs.Get<reg::RB_BLENDCONTROL>();
+    uint32_t fmts[4];
+    for (uint32_t i = 0; i < 4; ++i) {
+      reg::RB_COLOR_INFO color_info;
+      color_info.value = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+      fmts[i] = uint32_t(color_info.color_format);
+    }
+    // Observe (not infer) whether the FP10 clamp fix is physically active on
+    // RT0 of this draw: the actual host resource DXGI format the RT cache picks
+    // (115 = R16G16B16A16_UNORM means the format switch took effect; 10 =
+    // R16G16B16A16_FLOAT means it did not), and whether the per-draw RGB
+    // scaling flag would be set (format is FP10 and neither blend factor is a
+    // color factor - the exact condition from the flag loop).
+    auto is_color_blend_factor = [](xenos::BlendFactor f) {
+      return f == xenos::BlendFactor::kSrcColor ||
+             f == xenos::BlendFactor::kOneMinusSrcColor ||
+             f == xenos::BlendFactor::kDstColor ||
+             f == xenos::BlendFactor::kOneMinusDstColor;
+    };
+    reg::RB_COLOR_INFO rt0_info;
+    rt0_info.value = regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
+    uint32_t rt0_host_format = uint32_t(
+        render_target_cache_->GetColorResourceDXGIFormat(rt0_info.color_format));
+    bool rt0_is_fp10 =
+        rt0_info.color_format ==
+            xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+        rt0_info.color_format ==
+            xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16;
+    bool clamp_flag_would_set =
+        cvars::gpu_clamp_fp10_edram_output && rt0_is_fp10 &&
+        !is_color_blend_factor(blend0.color_srcblend) &&
+        !is_color_blend_factor(blend0.color_destblend);
+    uint64_t key = uint64_t(fmts[0]) | (uint64_t(fmts[1]) << 4) |
+                   (uint64_t(fmts[2]) << 8) | (uint64_t(fmts[3]) << 12) |
+                   (uint64_t(color_mask.value & 0xFFFF) << 16) |
+                   (uint64_t(uint32_t(mode_control.edram_mode)) << 32) |
+                   (uint64_t(rt0_host_format) << 40) |
+                   (uint64_t(clamp_flag_would_set ? 1 : 0) << 56);
+    if (key != last_halo_rt_key) {
+      last_halo_rt_key = key;
+      XELOGW(
+          "Halo RT: edram_mode={} color_mask=0x{:04X} rt0_fmt={} rt1_fmt={} "
+          "rt2_fmt={} rt3_fmt={} (3=FP10_7e3 7=16_16_16_16_FLOAT) blend0 "
+          "color_src={} color_dst={} alpha_src={} alpha_dst={} | clamp_cvar={} "
+          "rt0_host_dxgi={} (115=UNORM 10=FLOAT) clamp_flag_set={}",
+          uint32_t(mode_control.edram_mode), color_mask.value & 0xFFFF, fmts[0],
+          fmts[1], fmts[2], fmts[3], uint32_t(blend0.color_srcblend),
+          uint32_t(blend0.color_destblend), uint32_t(blend0.alpha_srcblend),
+          uint32_t(blend0.alpha_destblend),
+          cvars::gpu_clamp_fp10_edram_output ? 1 : 0, rt0_host_format,
+          clamp_flag_would_set ? 1 : 0);
+    }
+  }
+
   const bool memexport_used_pixel =
       pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   const bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+
+  // Diagnostic: log every draw with a tiny vertex count (a screen-aligned
+  // quad/sprite, e.g. index_count==4), REGARDLESS of blend mode. Unlike the
+  // earlier additive/translucent filters, this can't miss a sprite shader
+  // that turns out to use opaque blending (e.g. Fable II's moon halo, whose
+  // pixel shader hardcodes alpha=1.0 - found via RenderDoc pixel history -
+  // so the game may configure it as an ordinary opaque draw and rely purely
+  // on the sampled texture's color to look soft/translucent).
+  if (cvars::log_additive_draws) {
+    static std::unordered_set<uint64_t> logged_additive_draws;
+    if (logged_additive_draws.size() < 8192 && index_count <= 6) {
+      reg::RB_BLENDCONTROL bc = regs.Get<reg::RB_BLENDCONTROL>();
+      uint64_t key = vertex_shader->ucode_data_hash() * 1315423911u;
+      key ^= (pixel_shader ? pixel_shader->ucode_data_hash() : 0ull);
+      key ^= (uint64_t(index_count) << 40);
+      if (logged_additive_draws.insert(key).second) {
+        XELOGW(
+            "Small draw: VS={:016X} PS={:016X} src={} dst={} index_count={} "
+            "memexport={}",
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0ull,
+            uint32_t(bc.color_srcblend), uint32_t(bc.color_destblend),
+            index_count, memexport_used ? 1 : 0);
+      }
+    }
+  }
+
+  // Diagnostic: find the draw whose USED float shader constants carry a
+  // non-finite (Inf/NaN) or absurdly huge value. Stretched/exploding geometry
+  // driven by a bad transform/light CONSTANT (rather than bad vertex data) is
+  // invisible to DrawVertexDataHasNonFinite; this scans the actual constant
+  // registers the shader reads and prints the VS+PS hashes so the offending
+  // effect draw (e.g. Fable II's translucent "moon lighting" sheets) can be
+  // identified and fixed at its source.
+  if (cvars::log_nonfinite_constants) {
+    // Dedupe so each distinct (VS,PS,shader stage,constant,component) logs only
+    // once - otherwise a draw that recurs every frame (e.g. Fable II's PS
+    // c47.x=+Inf) floods the log and hides OTHER bad-constant draws (like a VS
+    // transform matrix that actually stretches geometry).
+    static std::unordered_set<uint64_t> logged_nonfinite_constants;
+    // Translucency: a draw blends with the framebuffer (is see-through) when its
+    // color blend isn't the opaque default (src=One, dst=Zero). The Fable II
+    // "sheets" are see-through, so this flag cuts the opaque world geometry out
+    // of the noise and isolates the offending translucent draw.
+    reg::RB_BLENDCONTROL blend_control = regs.Get<reg::RB_BLENDCONTROL>();
+    bool translucent_draw =
+        !(blend_control.color_srcblend == xenos::BlendFactor::kOne &&
+          blend_control.color_destblend == xenos::BlendFactor::kZero);
+    auto scan_constants = [&](const D3D12Shader* shader, bool is_pixel) {
+      if (!shader || logged_nonfinite_constants.size() >= 8192) {
+        return;
+      }
+      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+      uint32_t reg_base = is_pixel
+                              ? uint32_t(XE_GPU_REG_SHADER_CONSTANT_256_X)
+                              : uint32_t(XE_GPU_REG_SHADER_CONSTANT_000_X);
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint64_t entry = map.float_bitmap[i];
+        uint32_t idx;
+        while (xe::bit_scan_forward(entry, &idx)) {
+          entry = xe::clear_lowest_bit(entry);
+          uint32_t constant_index = (i << 6) + idx;
+          for (uint32_t c = 0; c < 4; ++c) {
+            uint32_t bits = regs[reg_base + (i << 8) + (idx << 2) + c];
+            // |value| >= 1e6f (0x49742400) also subsumes +/-Inf and NaN once
+            // the sign bit is masked off.
+            if ((bits & 0x7FFFFFFFu) >= 0x49742400u) {
+              uint64_t key = vertex_shader->ucode_data_hash() * 1315423911u;
+              key ^= (pixel_shader ? pixel_shader->ucode_data_hash() : 0ull) +
+                     0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2);
+              key ^= (uint64_t(is_pixel) << 40) | (uint64_t(constant_index) << 4) |
+                     c;
+              if (logged_nonfinite_constants.insert(key).second) {
+                float value;
+                std::memcpy(&value, &bits, sizeof(float));
+                XELOGW(
+                    "Non-finite constant: {} c{}[{}]=0x{:08X} ({}) VS={:016X} "
+                    "PS={:016X} memexport={} translucent={}",
+                    is_pixel ? "PS" : "VS", constant_index, c, bits, value,
+                    vertex_shader->ucode_data_hash(),
+                    pixel_shader ? pixel_shader->ucode_data_hash() : 0ull,
+                    memexport_used ? 1 : 0, translucent_draw ? 1 : 0);
+              }
+              break;
+            }
+          }
+        }
+      }
+    };
+    scan_constants(vertex_shader, false);
+    scan_constants(pixel_shader, true);
+  }
+
+  // Diagnostic/mitigation for meshes fed non-finite CPU-supplied vertex/
+  // transform data (they explode). When any of these cvars is on, check the
+  // guest vertex data; log it (log_nonfinite_draws), arm a writer trace on the
+  // offending page (trace_nonfinite_matrix_writer), and optionally drop the
+  // draw (skip_nonfinite_draws) so it vanishes for the frame instead of
+  // exploding. Never skip memexport draws - their export is a side effect later
+  // draws depend on.
+  // If a previously-captured writer was a data-mover, it stashed its source
+  // buffer's page; re-arm the watch on it here (a safe point, no memory lock
+  // held) to catch who computes the Inf one level up.
+  if (cvars::trace_nonfinite_matrix_writer) {
+    // Not cleared: the source watch disarms itself after each capture and is
+    // re-armed here every draw until it hits its capture cap.
+    uint32_t source_page =
+        nonfinite_trace_rearm_page_.load(std::memory_order_relaxed);
+    if (source_page) {
+      ArmNonfiniteSourceWatch(source_page);
+    }
+  }
+  if (cvars::log_nonfinite_draws || cvars::skip_nonfinite_draws ||
+      cvars::trace_nonfinite_matrix_writer ||
+      !cvars::skip_vs_hash_if_nonfinite.empty()) {
+    uint32_t nonfinite_base = 0;
+    if (draw_util::DrawVertexDataHasNonFinite(*memory_, regs, *vertex_shader,
+                                              &nonfinite_base)) {
+      // Targeted conditional skip: drop this specific draw only on the frames
+      // its data is garbage. Applies even to memexport draws (unlike
+      // skip_nonfinite_draws), so a memexport-fed consumer that explodes on
+      // garbage skinning (Fable II's 7C5710DEF3EE33C4) can be dropped exactly
+      // when it would explode while rendering normally otherwise.
+      if (!cvars::skip_vs_hash_if_nonfinite.empty() &&
+          VsHashInList(cvars::skip_vs_hash_if_nonfinite,
+                       vertex_shader->ucode_data_hash())) {
+        return true;
+      }
+      if (cvars::trace_nonfinite_matrix_writer &&
+          vertex_shader->ucode_data_hash() == 0x695413A9831D88DAull) {
+        // Only watch pages read by Fable II's dog matrix consumer. Other
+        // shaders also trip the detector (notably memexport targets, whose
+        // CPU-side RAM is stale when readback_memexport is off) and would
+        // burn the capture slots on unrelated pages - during loading their
+        // writers' registers don't point at a serializer source buffer at
+        // all, so the capture would also dereference junk.
+        ArmNonfiniteWriterTrace(nonfinite_base);
+      }
+      if (cvars::skip_nonfinite_draws && !memexport_used) {
+        return true;
+      }
+    }
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -3072,28 +3725,139 @@ bool D3D12CommandProcessor::IssueCopy() {
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
-  if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                    written_address, written_length)) {
-    if (!texture_cache_->IsDrawResolutionScaled() && written_length) {
-      // Early check: if destination memory is not accessible, skip all the
-      // expensive GPU readback work.
-      VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
-      bool memory_accessible = false;
-      if (physical_heap) {
-        HeapAllocationInfo alloc_info;
-        if (physical_heap->QueryRegionInfo(written_address, &alloc_info) &&
-            (alloc_info.state & kMemoryAllocationCommit) &&
-            (alloc_info.protect & kMemoryProtectWrite)) {
-          uint32_t end_address = written_address + written_length;
-          uint32_t region_end =
-              alloc_info.base_address + alloc_info.region_size;
-          if (end_address <= region_end) {
-            memory_accessible = true;
-          }
+  // Only read a resolve back to the CPU when the guest is actually likely to
+  // read it there. Depth resolves are never consumed as CPU-side morph sources,
+  // and reading them back is pure overhead (a mid-frame stall in "full" mode),
+  // so skip them. Color resolves are read back for all formats; a per-format
+  // restriction could be added as a cvar later if needed for performance.
+  bool readback_wanted =
+      register_file_->Get<reg::RB_COPY_CONTROL>().copy_src_select <
+      xenos::kMaxColorRenderTargets;
+  // Optional: restrict readback to the k_8_8_8_8 color format (what Fable II's
+  // morphs use), skipping other formats the CPU never reads.
+  if (readback_wanted && cvars::readback_resolve_8888_only) {
+    readback_wanted = register_file_->Get<reg::RB_COPY_DEST_INFO>()
+                          .copy_dest_format == xenos::ColorFormat::k_8_8_8_8;
+  }
+  // Optional: restrict readback to the two formats Fable II's CPU morphs use
+  // (k_8_8_8_8 dog, k_1_5_5_5 character body), skipping the many other resolve
+  // formats the CPU never reads (the bulk of resolves in practice).
+  if (readback_wanted && cvars::readback_resolve_morph_formats_only) {
+    xenos::ColorFormat dest_format =
+        register_file_->Get<reg::RB_COPY_DEST_INFO>().copy_dest_format;
+    readback_wanted = dest_format == xenos::ColorFormat::k_8_8_8_8 ||
+                      dest_format == xenos::ColorFormat::k_1_5_5_5;
+  }
+  // Optional: restrict readback to resolves targeting a small set of exact
+  // guest destination bases (the femtofork approach). Fable II resolves the
+  // CPU-read morph textures to a few fixed bases, so matching only those cuts
+  // readbacks from the ~10-45/frame the format/size filters still pass to ~1 -
+  // the biggest remaining framerate win, since the residual stall is the game
+  // blocking on each resolve fence. RB_COPY_DEST_BASE is the same register
+  // draw_util reads to compute the resolve destination. The comma-separated
+  // list is parsed once and cached until the cvar string changes.
+  if (readback_wanted && !cvars::readback_resolve_only_dest_bases.empty()) {
+    // Each comma-separated token is either a single base ("0x12d41000") or an
+    // inclusive range ("0x12700000-0x127fffff"). Fable II spreads the character
+    // morph over many small sub-textures in one region and the dog over
+    // another, so ranges cover them robustly (over-inclusion only costs a few
+    // extra readbacks; under-inclusion makes a morph go black). Parsed once and
+    // cached until the cvar string changes.
+    static std::string readback_dest_bases_cached;
+    static std::vector<std::pair<uint32_t, uint32_t>> readback_dest_ranges;
+    if (readback_dest_bases_cached != cvars::readback_resolve_only_dest_bases) {
+      readback_dest_bases_cached = cvars::readback_resolve_only_dest_bases;
+      readback_dest_ranges.clear();
+      size_t pos = 0;
+      const std::string& list = readback_dest_bases_cached;
+      while (pos <= list.size()) {
+        size_t comma = list.find(',', pos);
+        size_t end = comma == std::string::npos ? list.size() : comma;
+        std::string token = list.substr(pos, end - pos);
+        size_t first = token.find_first_not_of(" \t");
+        if (first != std::string::npos) {
+          size_t last = token.find_last_not_of(" \t");
+          token = token.substr(first, last - first + 1);
+          size_t dash = token.find('-');
+          uint32_t lo = uint32_t(std::strtoul(token.c_str(), nullptr, 0));
+          uint32_t hi =
+              dash == std::string::npos
+                  ? lo
+                  : uint32_t(std::strtoul(token.c_str() + dash + 1, nullptr, 0));
+          readback_dest_ranges.emplace_back(lo, hi);
         }
+        if (comma == std::string::npos) {
+          break;
+        }
+        pos = comma + 1;
+      }
+    }
+    uint32_t rb_copy_dest_base =
+        (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE];
+    readback_wanted = false;
+    for (const auto& range : readback_dest_ranges) {
+      if (rb_copy_dest_base >= range.first &&
+          rb_copy_dest_base <= range.second) {
+        readback_wanted = true;
+        break;
+      }
+    }
+  }
+  // When readback is wanted and resolution scaling is active, ask the resolve to
+  // also downsample the result into the 1x shared memory layout so the readback
+  // below can reach guest RAM at >1x (previously readback was skipped entirely
+  // when scaled, which left games that read resolved data on the CPU - e.g.
+  // Fable II's texture morphs - with black textures).
+  ID3D12Resource* readback_staging = nullptr;
+  bool resolve_succeeded = render_target_cache_->Resolve(
+      *memory_, *shared_memory_, *texture_cache_, written_address,
+      written_length,
+      /*resolve_to_shared_memory_for_readback=*/readback_wanted,
+      /*readback_max_length=*/cvars::readback_resolve_max_length,
+      &readback_staging);
+  if (readback_staging) {
+    // Lever C: the readback downsample wrote into the scratch GPU buffer
+    // (rebased so the data starts at offset 0). Transition it for the copy
+    // below and release the scratch reservation right away: the contents stay
+    // valid within this IssueCopy (nothing else requests the scratch buffer
+    // before the copy is recorded), and releasing here keeps every early-out
+    // below (readback skipped, unwritable destination, buffer allocation
+    // failure) from leaking the reservation. The transition also orders the
+    // downsample's UAV writes with the copy.
+    PushTransitionBarrier(readback_staging,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ReleaseScratchGPUBuffer(readback_staging,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+  if (resolve_succeeded) {
+    if (cvars::log_resolve_readback) {
+      auto copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
+      auto copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+      XELOGI(
+          "Resolve readback: dest_base={:#010x} addr={:#010x} len={} "
+          "src_select={} (depth={}) dest_format={} scaled={} readback_wanted={}",
+          (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE], written_address,
+          written_length, uint32_t(copy_control.copy_src_select),
+          copy_control.copy_src_select >= xenos::kMaxColorRenderTargets,
+          uint32_t(copy_dest_info.copy_dest_format),
+          texture_cache_->IsDrawResolutionScaled(), readback_wanted);
+    }
+    if (readback_wanted && written_length) {
+      // Skip reading back resolves larger than the configured cap - games only
+      // read small textures on the CPU; large full-screen resolves are never
+      // read, and reading them back costs a megabyte-scale copy plus a GPU sync
+      // stall at the next fence (because a pending readback forces a drain).
+      // Capping leaves only the small CPU-read resolves pending. Logged above
+      // (so the size is still visible for tuning) before this skip.
+      if (cvars::readback_resolve_max_length &&
+          written_length > cvars::readback_resolve_max_length) {
+        return true;
       }
 
-      if (!memory_accessible) {
+      // Early check: if destination memory is not accessible, skip all the
+      // expensive GPU readback work.
+      if (!IsReadbackDestinationWritable(written_address, written_length)) {
         // Destination memory not accessible, skip readback entirely
         return true;
       }
@@ -3104,7 +3868,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       ReadbackBuffer& rb = readback_buffers_[resolve_key];
       rb.last_used_frame = frame_current_;
 
+      const bool deferred_mode =
+          GetReadbackResolveMode() == ReadbackResolveMode::kDeferred;
       uint32_t write_index = rb.current_index;
+      // In deferred mode the copy of an earlier resolve of this key may still be
+      // awaited by an undelivered fence. Never overwrite a slot it reads - drain
+      // the deferred fences (blocking) first to free the whole ring. Rare: only
+      // when this key was resolved kReadbackRingSize times without delivery.
+      if (deferred_mode && ReadbackSlotInFlight(resolve_key, write_index)) {
+        readback_stall_site_ = kReadbackStallSiteRingGuard;
+        TryCompleteDeferredFences(/*block=*/true);
+      }
       uint32_t size = AlignReadbackBufferSize(written_length);
 
       // Allocate/resize write buffer if needed
@@ -3131,43 +3905,56 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         }
       }
 
-      // Copy resolved data to current frame's buffer
-      shared_memory_->UseAsCopySource();
-      SubmitBarriers();
-      ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
-      deferred_command_list_.D3DCopyBufferRegion(
-          rb.buffers[write_index], 0, shared_memory_buffer, written_address,
-          written_length);
-
-      ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-      bool use_delayed_sync = (readback_mode == ReadbackResolveMode::kFast);
-      uint32_t read_index = write_index;
-
-      if (use_delayed_sync) {
-        // Use previous frame's data (avoid stall)
-        read_index = 1 - write_index;
+      // Record the GPU copy of the resolved range into this resolve's readback
+      // buffer.
+      if (readback_staging) {
+        // Lever C: copy from the scratch buffer the downsample wrote (data at
+        // offset 0); the 512 MB shared-memory buffer is left untouched by the
+        // readback path.
+        SubmitBarriers();
+        deferred_command_list_.D3DCopyBufferRegion(
+            rb.buffers[write_index], 0, readback_staging, 0, written_length);
       } else {
-        // Wait for GPU to finish (accurate but slow)
-        if (!AwaitAllQueueOperationsCompletion()) {
-          return true;
+        shared_memory_->UseAsCopySource();
+        SubmitBarriers();
+        deferred_command_list_.D3DCopyBufferRegion(
+            rb.buffers[write_index], 0, shared_memory_->GetBuffer(),
+            written_address, written_length);
+      }
+      ++readback_frame_resolves_copied_;
+
+      if (GetReadbackResolveMode() == ReadbackResolveMode::kFast ||
+          deferred_mode) {
+        // "fast"/"deferred": don't stall now. Record the copy as pending; it is
+        // mapped and copied to guest RAM at the next GPU->CPU synchronization
+        // point (fence write / primary buffer end / swap) in
+        // FlushReadbacksForGuestVisibility() ("fast"), or when the submission
+        // holding the copy completes on its own ("deferred", via the fence
+        // deferral in HandleFenceWriteWithReadback). The guest cannot observe
+        // GPU completion until then, so it never reads stale data - yet every
+        // resolve between two fences shares a single GPU sync instead of forcing
+        // one each (the per-resolve stall was the cause of the slowdown).
+        PendingReadback& pending = pending_readbacks_[resolve_key];
+        pending.guest_address = written_address;
+        pending.length = written_length;
+        pending.buffer_index = write_index;
+        if (deferred_mode) {
+          // Advance the ring so the next resolve of this key uses a fresh slot,
+          // leaving this copy intact for its (still pending) deferred fence.
+          rb.current_index = (write_index + 1) % kReadbackRingSize;
         }
+        return true;
       }
 
-      // Read from the appropriate buffer
-      ID3D12Resource* read_source = rb.buffers[read_index];
-
-      // If using delayed sync but previous buffer doesn't exist, use current
-      // buffer with sync as fallback
-      if (use_delayed_sync &&
-          (read_source == nullptr || written_length > rb.sizes[read_index])) {
-        read_source = rb.buffers[write_index];
-        read_index = write_index;
-        if (!AwaitAllQueueOperationsCompletion()) {
-          return true;
-        }
+      // "full": stall the GPU now and copy to guest RAM immediately. Slower
+      // (serializes CPU and GPU on every resolve) but delivers the data even if
+      // a game reads a resolve without passing through a sync point that "fast"
+      // drains at - a correctness fallback.
+      if (!AwaitAllQueueOperationsCompletion()) {
+        return true;
       }
-
-      if (read_source != nullptr && written_length <= rb.sizes[read_index]) {
+      ID3D12Resource* read_source = rb.buffers[write_index];
+      if (read_source != nullptr && written_length <= rb.sizes[write_index]) {
         D3D12_RANGE readback_range;
         readback_range.Begin = 0;
         readback_range.End = written_length;
@@ -3187,6 +3974,531 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return false;
   }
   return true;
+}
+
+void D3D12CommandProcessor::FlushReadbacksForGuestVisibility(
+    bool at_fence_sync) {
+  // In "deferred" mode this is only reached at the coarse sync points
+  // (primary-buffer-end / swap / shutdown, all at_fence_sync=false) and the
+  // synchronous fallback in HandleFenceWriteWithReadback; per-fence delivery is
+  // handled there. Complete any deferred fences first, then deliver readbacks
+  // recorded after the last fence (which have no deferred fence) below.
+  if (GetReadbackResolveMode() == ReadbackResolveMode::kDeferred) {
+    if (cvars::readback_resolve_deferred_lazy && !at_fence_sync &&
+        !readback_flush_at_shutdown_) {
+      // Lazy deferred: don't block the command processor at primary-buffer-end
+      // or swap. Deliver whatever the GPU has already finished, and turn any
+      // readbacks recorded since the last guest fence into a valueless
+      // deferred fence so the existing completion machinery delivers them when
+      // their submission finishes on its own. Guest-visible ordering is
+      // unchanged - fence values are still written only after their data is in
+      // RAM - the CP just no longer waits for the GPU here. Forward progress
+      // for a guest busy-waiting on a deferred fence is guaranteed by the
+      // still-blocking CP-idle path (PrepareForWait).
+      TryCompleteDeferredFences(/*block=*/false);
+      if (pending_readbacks_.empty() || DeferPendingReadbacksAsFence()) {
+        return;
+      }
+      // Couldn't submit the pending copies - fall through to the blocking
+      // delivery below (rare).
+    }
+    TryCompleteDeferredFences(/*block=*/true);
+  }
+  if (pending_readbacks_.empty()) {
+    return;
+  }
+  // Per-fence drains are the most frequent and the biggest stall source. When
+  // disabled, defer delivery to the coarser primary-buffer-end / swap drains -
+  // fewer stalls, but a game that reads resolved data mid-buffer right after a
+  // fence may see it stale (hence the safe default of draining on fences).
+  if (at_fence_sync && !cvars::readback_resolve_drain_on_fence) {
+    return;
+  }
+  // A single GPU stall covers every resolve copied since the last flush; after
+  // it completes, all of those readback buffers hold finished data.
+  if (at_fence_sync) {
+    ++readback_frame_fence_stalls_;
+  }
+  auto stall_begin = std::chrono::steady_clock::now();
+  bool await_ok = AwaitAllQueueOperationsCompletion();
+  uint64_t stall_ns = uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - stall_begin)
+          .count());
+  readback_frame_stall_ns_ += stall_ns;
+  readback_frame_stall_site_ns_[readback_stall_site_] += stall_ns;
+  if (!await_ok) {
+    pending_readbacks_.clear();
+    return;
+  }
+  for (auto& pair : pending_readbacks_) {
+    const PendingReadback& pending = pair.second;
+    auto rb_it = readback_buffers_.find(pair.first);
+    if (rb_it == readback_buffers_.end()) {
+      continue;
+    }
+    ID3D12Resource* buffer = rb_it->second.buffers[pending.buffer_index];
+    if (buffer == nullptr ||
+        pending.length > rb_it->second.sizes[pending.buffer_index]) {
+      continue;
+    }
+    D3D12_RANGE readback_range;
+    readback_range.Begin = 0;
+    readback_range.End = pending.length;
+    void* readback_mapping;
+    if (SUCCEEDED(buffer->Map(0, &readback_range, &readback_mapping))) {
+      // Destination accessibility was checked before the copy was recorded.
+      // chrispy: this memcpy needs to be optimized as much as possible
+      auto physaddr = memory_->TranslatePhysical(pending.guest_address);
+      memory::vastcpy(physaddr, (uint8_t*)readback_mapping, pending.length);
+      D3D12_RANGE readback_write_range = {};
+      buffer->Unmap(0, &readback_write_range);
+    }
+  }
+  pending_readbacks_.clear();
+}
+
+void D3D12CommandProcessor::ArmNonfiniteWriterTrace(uint32_t physical_base) {
+  // Stop after enough captures (the writer is the same code each time).
+  if (nonfinite_trace_captures_.load(std::memory_order_relaxed) >= 3u) {
+    return;
+  }
+  uint32_t page = physical_base & ~uint32_t(0xFFF);
+  // Only (re)arm when not currently armed, so we don't thrash the page watch;
+  // the callback disarms after it captures one write.
+  uint32_t expected = 0;
+  if (nonfinite_trace_base_.compare_exchange_strong(
+          expected, page, std::memory_order_relaxed)) {
+    // Ensure the page faults on the next guest write so the callback fires.
+    memory_->EnablePhysicalMemoryAccessCallbacks(page, 0x1000u, true, false);
+  }
+}
+
+std::pair<uint32_t, uint32_t>
+D3D12CommandProcessor::NonfiniteWriterCallbackThunk(void* context_ptr,
+                                                    uint32_t physical_address_start,
+                                                    uint32_t length,
+                                                    bool exact_range) {
+  return reinterpret_cast<D3D12CommandProcessor*>(context_ptr)
+      ->NonfiniteWriterCallback(physical_address_start, length);
+}
+
+std::pair<uint32_t, uint32_t> D3D12CommandProcessor::NonfiniteWriterCallback(
+    uint32_t address, uint32_t length) {
+  // Runs under the memory global lock on the guest thread that wrote, so this
+  // must not read guest memory (could re-enter) or take other locks - it only
+  // reads the current thread's register context.
+  const std::pair<uint32_t, uint32_t> dont_care(uint32_t(0), UINT32_MAX);
+  uint32_t armed = nonfinite_trace_base_.load(std::memory_order_relaxed);
+  if (!armed || address >= armed + 0x1000u || address + length <= armed) {
+    return dont_care;
+  }
+  if (nonfinite_trace_captures_.load(std::memory_order_relaxed) >= 3u) {
+    return dont_care;
+  }
+  cpu::ThreadState* thread_state = cpu::ThreadState::Get();
+  if (!thread_state || !thread_state->context()) {
+    return dont_care;
+  }
+  auto* ctx = thread_state->context();
+  uint32_t capture =
+      nonfinite_trace_captures_.fetch_add(1, std::memory_order_relaxed) + 1;
+  // LR is the return address into the caller of the function performing the
+  // store - the strongest clue to which guest routine builds the bad matrix.
+  XELOGW(
+      "Nonfinite-matrix writer #{}: wrote {:#010x} (armed page {:#010x}) "
+      "guest LR={:#010x} CTR={:#010x} sp(r1)={:#010x}",
+      capture, address, armed, uint32_t(ctx->lr), uint32_t(ctx->ctr),
+      uint32_t(ctx->r[1]));
+  // Full GPR set: the caller (LR=0x821d34xx) is an integer byte-swap/scatter
+  // serializer with NO float ops - it copies matrices from a guest source
+  // buffer into the GPU pool. The source pointer is in here (r6/r8 ~= the heap
+  // buffer); we need it to chase one level up toward the real computation.
+  for (uint32_t base = 0; base < 32; base += 8) {
+    XELOGW(
+        "  r{}={:#010x} r{}={:#010x} r{}={:#010x} r{}={:#010x} r{}={:#010x} "
+        "r{}={:#010x} r{}={:#010x} r{}={:#010x}",
+        base + 0, uint32_t(ctx->r[base + 0]), base + 1,
+        uint32_t(ctx->r[base + 1]), base + 2, uint32_t(ctx->r[base + 2]),
+        base + 3, uint32_t(ctx->r[base + 3]), base + 4,
+        uint32_t(ctx->r[base + 4]), base + 5, uint32_t(ctx->r[base + 5]),
+        base + 6, uint32_t(ctx->r[base + 6]), base + 7,
+        uint32_t(ctx->r[base + 7]));
+  }
+  // Whether a guest address is committed and readable, asked of Xenia's own
+  // heap bookkeeping. The host QueryProtect used earlier reports the giant
+  // reserved file-mapping region, not per-guest-page state, so it wrongly
+  // rejected committed virtual-heap pages like the serializer source; the
+  // guest heap is authoritative. Reads here are plain host loads (no locks),
+  // safe under the memory global lock as long as the page is committed.
+  auto guest_readable = [this](uint32_t addr) -> bool {
+    BaseHeap* heap = memory_->LookupHeap(addr);
+    if (!heap) {
+      return false;
+    }
+    uint32_t protect = 0;
+    if (!heap->QueryProtect(addr, &protect)) {
+      return false;
+    }
+    return (protect & kMemoryProtectRead) != 0;
+  };
+  auto dump_words = [this, armed, &guest_readable](const char* what,
+                                                   uint32_t addr,
+                                                   uint32_t word_count) {
+    if (addr < 0x10000u || (addr & ~uint32_t(0xFFF)) == armed) {
+      return;
+    }
+    if (!guest_readable(addr)) {
+      XELOGW("  [{} {:#010x}] not committed/readable", what, addr);
+      return;
+    }
+    const uint8_t* host = memory_->TranslateVirtual<const uint8_t*>(addr);
+    if (!host) {
+      return;
+    }
+    for (uint32_t i = 0; i < word_count; i += 4) {
+      XELOGW("  [{}+{:#x}] {:08x} {:08x} {:08x} {:08x}", what, i * 4u,
+             xe::load_and_swap<uint32_t>(host + (i + 0) * 4u),
+             xe::load_and_swap<uint32_t>(host + (i + 1) * 4u),
+             xe::load_and_swap<uint32_t>(host + (i + 2) * 4u),
+             xe::load_and_swap<uint32_t>(host + (i + 3) * 4u));
+    }
+  };
+  // NOTE (2026-07-04): the tail loop here is a pure memcpy scatter
+  // (memcpy(pool + index*12, stack_staging, 12)); r6/r8=0x25f81000 is the
+  // record-loop EXCLUSIVE END sentinel (one-past-the-end -> reads as
+  // uncommitted), NOT a data source. The matrix values are staged earlier in
+  // this same function from the real source. So dump the FULL function body to
+  // find where the staging buffer is filled and from what source address.
+  bool is_serializer = (uint32_t(ctx->lr) & ~uint32_t(0xFFF)) == 0x821d3000u;
+  // Wide stack dump around the staging buffer (r1+0x60 == r31) - a scatter
+  // record that is +Inf lands here for an Inf-carrying call.
+  dump_words("stk(r1)", uint32_t(ctx->r[1]), 192);
+  // Raw guest PPC code covering the whole function (frame is 0x250; the tail
+  // scatter, the byte-swap/staging-fill phase and the prologue all precede the
+  // return address). Guest code is big-endian in memory; load_and_swap yields
+  // the natural instruction encoding. Disassembled offline to find the matrix
+  // source load.
+  uint32_t lr = uint32_t(ctx->lr);
+  if (is_serializer && lr >= 0x82000500u) {
+    uint32_t code_start = (lr - 0x400u) & ~uint32_t(0x3);
+    for (uint32_t off = 0; off < 0x420u; off += 4) {
+      uint32_t code_addr = code_start + off;
+      if (!guest_readable(code_addr)) {
+        continue;
+      }
+      const uint8_t* code_host =
+          memory_->TranslateVirtual<const uint8_t*>(code_addr);
+      if (!code_host) {
+        continue;
+      }
+      XELOGW("  code {:#010x}: {:08x}{}", code_addr,
+             xe::load_and_swap<uint32_t>(code_host),
+             code_addr == lr ? "  <- LR (return)" : "");
+    }
+  }
+  // Disarm; the next detected non-finite draw (or the re-arm above) re-arms.
+  nonfinite_trace_base_.store(0, std::memory_order_relaxed);
+  return dont_care;
+}
+
+void D3D12CommandProcessor::ArmNonfiniteSourceWatch(uint32_t guest_page) {
+  guest_page &= ~uint32_t(0xFFF);
+  if (!guest_page) {
+    return;
+  }
+  if (nonfinite_source_captures_.load(std::memory_order_relaxed) >= 8u) {
+    return;
+  }
+  if (nonfinite_source_host_base_.load(std::memory_order_acquire)) {
+    // Still armed from a previous draw, waiting for a write.
+    return;
+  }
+  uint8_t* host_base = memory_->TranslateVirtual<uint8_t*>(guest_page);
+  if (!host_base) {
+    return;
+  }
+  if (!nonfinite_source_handler_installed_) {
+    ExceptionHandler::Install(NonfiniteSourceWatchHandlerThunk, this);
+    nonfinite_source_handler_installed_ = true;
+  }
+  nonfinite_source_guest_page_ = guest_page;
+  // Publish the match window and host base before revoking write access so a
+  // fault occurring immediately is recognized by the handler.
+  nonfinite_source_watch_window_.store(host_base, std::memory_order_release);
+  nonfinite_source_host_base_.store(host_base, std::memory_order_release);
+  if (!xe::memory::Protect(host_base, 0x1000u, memory::PageAccess::kReadOnly,
+                           nullptr)) {
+    nonfinite_source_host_base_.store(nullptr, std::memory_order_release);
+    // Don't retry every draw (the page is likely not committed) - drop the
+    // pending source page until a future serializer capture stashes it again.
+    nonfinite_trace_rearm_page_.store(0, std::memory_order_relaxed);
+    XELOGW("Nonfinite-source watch: failed to protect guest page {:#010x}",
+           guest_page);
+    return;
+  }
+  XELOGW("Nonfinite-source watch armed on guest page {:#010x}", guest_page);
+}
+
+bool D3D12CommandProcessor::NonfiniteSourceWatchHandlerThunk(Exception* ex,
+                                                             void* data) {
+  return reinterpret_cast<D3D12CommandProcessor*>(data)
+      ->NonfiniteSourceWatchHandler(ex);
+}
+
+bool D3D12CommandProcessor::NonfiniteSourceWatchHandler(Exception* ex) {
+  if (ex->code() != Exception::Code::kAccessViolation) {
+    return false;
+  }
+  // Match against the persistent window, not the armed state: a second thread
+  // can fault on the page concurrently with the handler that disarms it, and
+  // its exception must still be recognized and retried.
+  uint8_t* window = nonfinite_source_watch_window_.load(std::memory_order_acquire);
+  if (!window) {
+    return false;
+  }
+  uint64_t fault_address = ex->fault_address();
+  uint64_t page_start = reinterpret_cast<uint64_t>(window);
+  if (fault_address < page_start || fault_address >= page_start + 0x1000u) {
+    return false;
+  }
+  // Restore write access so the faulting store proceeds when retried;
+  // idempotent if a racing handler already did it. IssueDraw re-arms for the
+  // next capture.
+  xe::memory::Protect(window, 0x1000u, memory::PageAccess::kReadWrite,
+                      nullptr);
+  // Only the thread that wins the disarm logs a capture; a racing loser just
+  // retries its store against the now-writable page.
+  if (nonfinite_source_host_base_.exchange(nullptr, std::memory_order_acq_rel) !=
+      window) {
+    return true;
+  }
+  uint32_t capture =
+      nonfinite_source_captures_.fetch_add(1, std::memory_order_relaxed) + 1;
+  uint32_t page_offset = uint32_t(fault_address - page_start);
+  uint64_t host_pc = ex->pc();
+  // Resolve the writing host instruction to guest code. A null function means
+  // the writer is host code (e.g. kernel emulation memcpy), not guest JIT.
+  uint32_t guest_function = 0;
+  uint32_t guest_instruction = 0;
+  cpu::Processor* processor = kernel_state_->processor();
+  if (processor && processor->backend() && processor->backend()->code_cache()) {
+    cpu::GuestFunction* function =
+        processor->backend()->code_cache()->LookupFunction(host_pc);
+    if (function) {
+      guest_function = function->address();
+      guest_instruction =
+          function->MapMachineCodeToGuestAddress(uintptr_t(host_pc));
+    }
+  }
+  uint32_t lr = 0;
+  cpu::ThreadState* thread_state = cpu::ThreadState::Get();
+  if (thread_state && thread_state->context()) {
+    lr = uint32_t(thread_state->context()->lr);
+  }
+  XELOGW(
+      "Nonfinite-source writer #{}: wrote guest {:#010x} (page {:#010x} + "
+      "{:#x}) host RIP={:#x} -> guest fn {:#010x}, guest instr {:#010x}, "
+      "LR={:#010x}",
+      capture, nonfinite_source_guest_page_ + page_offset,
+      nonfinite_source_guest_page_, page_offset, host_pc, guest_function,
+      guest_instruction, lr);
+  return true;
+}
+
+bool D3D12CommandProcessor::HandleFenceWriteWithReadback(
+    uint8_t* write_destination, uint32_t data_value) {
+  readback_stall_site_ = kReadbackStallSiteFence;
+  if (GetReadbackResolveMode() != ReadbackResolveMode::kDeferred) {
+    // "fast"/"full"/"none": flush synchronously (a GPU stall if anything is
+    // pending) and let the caller store the fence value - unchanged behaviour.
+    FlushReadbacksForGuestVisibility(/*at_fence_sync=*/true);
+    return false;
+  }
+  // "deferred": opportunistically deliver any earlier deferred fences whose GPU
+  // work already finished (no stall), so the deque stays short and ring slots
+  // free up.
+  TryCompleteDeferredFences(/*block=*/false);
+  bool have_pending = !pending_readbacks_.empty();
+  // The fence value must become visible to the guest in program order relative
+  // to ALL outstanding readbacks - not just the ones from this fence. The guest
+  // may gate a morph read on a LATER fence than the one immediately after the
+  // resolve, so if any earlier deferred fence is still outstanding, this fence
+  // (even with nothing pending of its own) must also be deferred behind it.
+  // Writing it now would let the guest pass it and read a morph whose deferred
+  // readback has not yet landed. Only when nothing is outstanding may the caller
+  // write the value immediately (the common, fast path).
+  if (!have_pending && deferred_fences_.empty()) {
+    return false;
+  }
+  DeferredFence fence;
+  fence.write_destination = write_destination;
+  fence.data_value = data_value;
+  if (have_pending) {
+    // New readback copies to deliver: submit them without waiting, and gate this
+    // fence on that submission completing.
+    fence.target_submission = GetCurrentSubmission();
+    if (!submission_open_ || !EndSubmission(false)) {
+      // Couldn't submit (no open submission, or submission failed) - fall back
+      // to the synchronous path. It drains all outstanding deferred fences in
+      // order and delivers the pending copies, so the data is in RAM before the
+      // caller stores this fence value.
+      FlushReadbacksForGuestVisibility(/*at_fence_sync=*/true);
+      return false;
+    }
+    fence.readbacks.reserve(pending_readbacks_.size());
+    for (const auto& pair : pending_readbacks_) {
+      fence.readbacks.push_back({pair.first, pair.second.guest_address,
+                                 pair.second.length, pair.second.buffer_index});
+    }
+    pending_readbacks_.clear();
+  } else {
+    // No new copies, but earlier deferred fences are still outstanding. This
+    // fence carries no GPU data of its own; FIFO order in the deque guarantees
+    // its value is written only after every prior fence (and its readbacks) has
+    // been delivered. Gate it on the latest outstanding submission so it never
+    // races ahead of them.
+    fence.target_submission = deferred_fences_.back().target_submission;
+  }
+  deferred_fences_.push_back(std::move(fence));
+  // We own the store; it happens in TryCompleteDeferredFences once the GPU work
+  // is done and the prior readbacks are in guest RAM.
+  return true;
+}
+
+void D3D12CommandProcessor::TryCompleteDeferredFences(bool block) {
+  if (deferred_fences_.empty()) {
+    return;
+  }
+  if (!block) {
+    // Refresh the completed-submission value without waiting on the GPU.
+    completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
+  }
+  while (!deferred_fences_.empty()) {
+    DeferredFence& fence = deferred_fences_.front();
+    if (block) {
+      // Wait for this fence's submission; measured as a readback stall.
+      auto stall_begin = std::chrono::steady_clock::now();
+      CheckSubmissionCompletion(fence.target_submission);
+      uint64_t stall_ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - stall_begin)
+              .count());
+      readback_frame_stall_ns_ += stall_ns;
+      readback_frame_stall_site_ns_[readback_stall_site_] += stall_ns;
+    }
+    if (GetCompletedSubmission() < fence.target_submission) {
+      // Not finished yet; later entries are newer submissions, so stop.
+      break;
+    }
+    // GPU work done: deliver each readback to guest RAM, then make the fence
+    // value the guest polls visible (strictly after its data is in RAM).
+    for (const DeferredReadback& rb : fence.readbacks) {
+      auto rb_it = readback_buffers_.find(rb.key);
+      if (rb_it == readback_buffers_.end()) {
+        continue;
+      }
+      ID3D12Resource* buffer = rb_it->second.buffers[rb.buffer_index];
+      if (buffer == nullptr || rb.length > rb_it->second.sizes[rb.buffer_index]) {
+        continue;
+      }
+      // Re-validate the destination: an area change between deferral and now may
+      // have freed or remapped this guest range. Writing to it then would
+      // corrupt memory or crash, so drop the readback if it is no longer
+      // committed and writable (the texture is being torn down anyway).
+      if (!IsReadbackDestinationWritable(rb.guest_address, rb.length)) {
+        continue;
+      }
+      D3D12_RANGE readback_range;
+      readback_range.Begin = 0;
+      readback_range.End = rb.length;
+      void* readback_mapping;
+      if (SUCCEEDED(buffer->Map(0, &readback_range, &readback_mapping))) {
+        auto physaddr = memory_->TranslatePhysical(rb.guest_address);
+        memory::vastcpy(physaddr, (uint8_t*)readback_mapping, rb.length);
+        D3D12_RANGE readback_write_range = {};
+        buffer->Unmap(0, &readback_write_range);
+      }
+    }
+    // Valueless (synthetic) fences from lazy deferred mode carry only
+    // readbacks - there is no guest fence value to store for them.
+    if (fence.write_destination) {
+      xe::store(fence.write_destination, fence.data_value);
+    }
+    ++readback_frame_deferred_delivered_;
+    deferred_fences_.pop_front();
+  }
+}
+
+bool D3D12CommandProcessor::DeferPendingReadbacksAsFence() {
+  // Lazy deferred mode: attach the readbacks recorded since the last guest
+  // fence to a valueless DeferredFence gated on the submission holding their
+  // GPU copies, submitting it without waiting. TryCompleteDeferredFences
+  // delivers them once the GPU finishes on its own.
+  DeferredFence fence;
+  fence.write_destination = nullptr;
+  fence.data_value = 0;
+  if (submission_open_) {
+    fence.target_submission = GetCurrentSubmission();
+    if (!EndSubmission(false)) {
+      return false;
+    }
+  } else {
+    // Nothing open - every recorded copy is already in a submitted submission,
+    // the newest of which is the one before the upcoming index. Submission
+    // completion is monotonic, so gating on it covers all of them (and keeps
+    // deferred_fences_ target_submission values non-decreasing).
+    fence.target_submission = GetCurrentSubmission() - 1;
+  }
+  fence.readbacks.reserve(pending_readbacks_.size());
+  for (const auto& pair : pending_readbacks_) {
+    fence.readbacks.push_back({pair.first, pair.second.guest_address,
+                               pair.second.length, pair.second.buffer_index});
+  }
+  pending_readbacks_.clear();
+  deferred_fences_.push_back(std::move(fence));
+  return true;
+}
+
+bool D3D12CommandProcessor::ReadbackSlotInFlight(uint64_t key,
+                                                 uint32_t slot) const {
+  for (const DeferredFence& fence : deferred_fences_) {
+    for (const DeferredReadback& rb : fence.readbacks) {
+      if (rb.key == key && rb.buffer_index == slot) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::IsReadbackDestinationWritable(
+    uint32_t address, uint32_t length) const {
+  VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
+  if (!physical_heap) {
+    return false;
+  }
+  HeapAllocationInfo alloc_info;
+  if (!physical_heap->QueryRegionInfo(address, &alloc_info) ||
+      !(alloc_info.state & kMemoryAllocationCommit) ||
+      !(alloc_info.protect & kMemoryProtectWrite)) {
+    return false;
+  }
+  uint32_t end_address = address + length;
+  uint32_t region_end = alloc_info.base_address + alloc_info.region_size;
+  return end_address <= region_end;
+}
+
+void D3D12CommandProcessor::PrepareForWait() {
+  // The command processor is about to idle waiting for more guest commands. If
+  // a deferred-mode fence is still outstanding the guest may be busy-waiting on
+  // its value right now, so force-complete deferred fences here (blocking is
+  // free - there is no GPU work to feed while idle). Forward progress is also
+  // guaranteed because OnPrimaryBufferEnd drains before this, but this is the
+  // belt-and-suspenders path.
+  readback_stall_site_ = kReadbackStallSiteIdle;
+  TryCompleteDeferredFences(/*block=*/true);
+  CommandProcessor::PrepareForWait();
 }
 
 void D3D12CommandProcessor::CheckSubmissionCompletion(
@@ -3365,11 +4677,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
 
-    // Swap all readback buffers for delayed sync (one frame behind)
-    for (auto& pair : readback_buffers_) {
-      pair.second.current_index = 1 - pair.second.current_index;
-    }
-
     // Evict old readback buffers only when map gets too large to prevent
     // unbounded memory growth. Don't do this every frame as it's expensive.
     if (readback_buffers_.size() > kMaxReadbackBuffers) {
@@ -3379,12 +4686,13 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
         if (frame_current_ > kReadbackBufferEvictionAgeFrames &&
             it->second.last_used_frame <
                 frame_current_ - kReadbackBufferEvictionAgeFrames) {
-          // Release both buffers
-          if (it->second.buffers[0] != nullptr) {
-            it->second.buffers[0]->Release();
-          }
-          if (it->second.buffers[1] != nullptr) {
-            it->second.buffers[1]->Release();
+          // Release all ring slots. The age gate guarantees this key wasn't
+          // used recently, so no undelivered deferred fence (all drained at the
+          // prior swap) can still reference it.
+          for (uint32_t i = 0; i < kReadbackRingSize; ++i) {
+            if (it->second.buffers[i] != nullptr) {
+              it->second.buffers[i]->Release();
+            }
           }
           it = readback_buffers_.erase(it);
         } else {
@@ -3785,6 +5093,15 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
   if (pa_cl_vte_cntl.vtx_w0_fmt) {
     flags |= DxbcShaderTranslator::kSysFlag_WNotReciprocal;
   }
+  // Optional mitigation: flush non-finite (NaN/Inf) vertex output positions to
+  // the clip-space origin so geometry fed bad transform data collapses to a
+  // point instead of exploding to infinity (e.g. Fable II's dog).
+  if (cvars::gpu_flush_nonfinite_vertex) {
+    flags |= DxbcShaderTranslator::kSysFlag_FlushNonfinitePosition;
+  }
+  if (cvars::gpu_flush_nonfinite_vertex_fetch) {
+    flags |= DxbcShaderTranslator::kSysFlag_FlushNonfiniteVertexFetch;
+  }
   // Whether the primitive is polygonal and SV_IsFrontFace matters.
   if constexpr (primitive_polygonal) {
     flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
@@ -3811,6 +5128,45 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
           xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
         flags |= DxbcShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
       }
+    }
+  }
+  // FP10 (7e3) range clamp on the host-render-target (RTV) path. The float16
+  // resource backing a k_2_10_10_10_FLOAT target does not clamp to the 7e3
+  // range [0, 31.875] the way console EDRAM (and the ROV path) does, so bright
+  // additive HDR content accumulates past 31.875 and blows out after the
+  // game's tonemap (Fable II moon halo hard-disc bug). Clamp the shader color
+  // output for FP10 targets to emulate the console range. ROV handles this
+  // itself via edram_rt_clamp, so only the RTV path needs the flag.
+  if (!edram_rov_used && cvars::gpu_clamp_fp10_edram_output) {
+    // The 1/31.875 output scale that maps FP10 RGB into the UNORM host range is
+    // only correct when the source color is combined with a non-color blend
+    // factor (additive, alpha, or opaque - the common cases). For blends that
+    // multiply by a COLOR factor (Src/DstColor - e.g. Fable II's multiplicative
+    // character blob shadows), scaling the source would make the stored result
+    // 31.875x too dark (solid black blobs); skip the scale for those draws so
+    // the already-scaled destination provides the correct factor and the result
+    // still lands in the scaled UNORM representation.
+    auto is_color_blend_factor = [](xenos::BlendFactor f) {
+      return f == xenos::BlendFactor::kSrcColor ||
+             f == xenos::BlendFactor::kOneMinusSrcColor ||
+             f == xenos::BlendFactor::kDstColor ||
+             f == xenos::BlendFactor::kOneMinusDstColor;
+    };
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (color_infos[i].color_format !=
+              xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT &&
+          color_infos[i].color_format !=
+              xenos::ColorRenderTargetFormat::
+                  k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+        continue;
+      }
+      reg::RB_BLENDCONTROL blend_control;
+      blend_control.value = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
+      if (is_color_blend_factor(blend_control.color_srcblend) ||
+          is_color_blend_factor(blend_control.color_destblend)) {
+        continue;
+      }
+      flags |= DxbcShaderTranslator::kSysFlag_ClampColor0ToFloat10 << i;
     }
   }
   if constexpr (edram_rov_used) {
@@ -4403,6 +5759,28 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                 sizeof(current_float_constant_map_pixel_));
   }
 
+  // Copies one vec4 float constant (4 words) from the register file to the
+  // upload buffer. When gpu_sanitize_nonfinite_constants is on, non-finite
+  // (Inf/NaN - all exponent bits set) components are replaced with 0 so a
+  // shader fed a bad CPU-computed constant shades finite instead of blowing up
+  // (e.g. Fable II's PS c47.x = +Inf that turns a translucent effect into
+  // flickering sheets). Only non-finite values are altered.
+  const bool sanitize_nonfinite_constants =
+      cvars::gpu_sanitize_nonfinite_constants;
+  auto copy_float_constant = [sanitize_nonfinite_constants](
+                                 uint8_t* dst, const uint32_t* src) {
+    if (!sanitize_nonfinite_constants) {
+      std::memcpy(dst, src, 4 * sizeof(float));
+      return;
+    }
+    uint32_t sanitized[4];
+    for (uint32_t c = 0; c < 4; ++c) {
+      uint32_t bits = src[c];
+      sanitized[c] = ((bits & 0x7F800000u) == 0x7F800000u) ? 0u : bits;
+    }
+    std::memcpy(dst, sanitized, sizeof(sanitized));
+  };
+
   // Write the constant buffer data.
   if (!cbuffer_binding_system_.up_to_date) {
     uint8_t* system_constants = constant_buffer_pool_->Request(
@@ -4439,10 +5817,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                   &float_constant_index)) {
         float_constant_map_entry =
             xe::clear_lowest_bit(float_constant_map_entry);
-        std::memcpy(float_constants,
-                    &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) +
-                          (float_constant_index << 2)],
-                    4 * sizeof(float));
+        copy_float_constant(float_constants,
+                            &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) +
+                                  (float_constant_index << 2)]);
         float_constants += 4 * sizeof(float);
       }
     }
@@ -4470,10 +5847,21 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                     &float_constant_index)) {
           float_constant_map_entry =
               xe::clear_lowest_bit(float_constant_map_entry);
-          std::memcpy(float_constants,
-                      &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) +
-                            (float_constant_index << 2)],
-                      4 * sizeof(float));
+          if (cvars::log_ps_c31_writes && i == 0 && float_constant_index == 31) {
+            const uint32_t* c31_words =
+                &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) +
+                      (float_constant_index << 2)];
+            XELOGW(
+                "PS c31 UPLOAD: ({}, {}, {}, {}) PS={:016X}",
+                *reinterpret_cast<const float*>(&c31_words[0]),
+                *reinterpret_cast<const float*>(&c31_words[1]),
+                *reinterpret_cast<const float*>(&c31_words[2]),
+                *reinterpret_cast<const float*>(&c31_words[3]),
+                pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0);
+          }
+          copy_float_constant(float_constants,
+                              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X +
+                                    (i << 8) + (float_constant_index << 2)]);
           float_constants += 4 * sizeof(float);
         }
       }

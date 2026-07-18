@@ -42,6 +42,7 @@ bool XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
 
 bool XSemaphore::ReleaseSemaphore(int32_t release_count,
                                   int32_t* out_previous_count) {
+  DbgRecordSignal(4);
   int32_t previous_count = 0;
   bool success = semaphore_->Release(release_count, &previous_count);
   if (out_previous_count) {

@@ -84,9 +84,30 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
+  // resolve_to_shared_memory_for_readback: when resolution scaling is active,
+  // additionally GPU-downsample the scaled resolve result back into the 1x
+  // shared memory layout so it can be read back to guest RAM on the CPU. Has no
+  // effect at 1x (the resolve already writes shared memory directly). Pass false
+  // when readback is disabled to avoid the extra downsample dispatch.
+  // readback_max_length: when nonzero, skip the readback downsample (and its
+  // shared-memory commit + transition) for resolves whose destination exceeds
+  // this many bytes. The command processor skips copying such resolves back
+  // anyway (readback_resolve_max_length), so downsampling them is pure wasted
+  // GPU bandwidth plus a needless state transition of the 512 MB shared-memory
+  // buffer.
+  // readback_staging_out: if non-null and the readback downsample ran routed
+  // through the command processor's scratch GPU buffer (Lever C), receives that
+  // buffer: the downsampled 1x bytes are at offset 0 (length
+  // written_length_out), the buffer is in the UNORDERED_ACCESS state, and the
+  // scratch reservation is still held - the caller must copy from it and
+  // release it via ReleaseScratchGPUBuffer. Otherwise set to null, and the
+  // downsample (if any) went to shared memory as before.
   bool Resolve(const Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out,
+               bool resolve_to_shared_memory_for_readback = false,
+               uint64_t readback_max_length = 0,
+               ID3D12Resource** readback_staging_out = nullptr);
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
@@ -218,6 +239,25 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(
       draw_util::ResolveCopyShaderIndex::kCount)] = {};
+
+  // Resolution-scaled resolve -> 1x downsample for CPU readback.
+  // Reads the current scaled resolve range (SRV) and writes nearest-neighbor 1x
+  // bytes into shared memory (UAV) so resolve results reach guest RAM at >1x.
+  // Parameter 0 - draw_util::ResolveCopyShaderConstants (dest_base is the 1x
+  //               guest destination base).
+  // Parameter 1 - destination (shared memory).
+  // Parameter 2 - source (current scaled resolve range).
+  // Indexed by bytes-per-block log2 (0..4 for 8/16/32/64/128bpp).
+  static constexpr size_t kResolveDownsampleShaderCount = 5;
+  ID3D12RootSignature* resolve_downsample_root_signature_ = nullptr;
+  struct ResolveDownsampleShaderCode {
+    const void* code;
+    size_t size;
+  };
+  static const ResolveDownsampleShaderCode
+      kResolveDownsampleShaders[kResolveDownsampleShaderCount];
+  ID3D12PipelineState*
+      resolve_downsample_pipelines_[kResolveDownsampleShaderCount] = {};
 
   // For traces.
   ID3D12Resource* edram_snapshot_download_buffer_ = nullptr;

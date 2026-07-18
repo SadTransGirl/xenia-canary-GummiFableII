@@ -488,6 +488,22 @@ struct MemExportRange {
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
 
+// Diagnostic: logs the vertex fetch constants and attribute layout of a draw,
+// plus the raw bytes/floats of the first few vertices read straight from guest
+// RAM (only when the log_vertex_fetch_constants cvar is enabled). Used to
+// compare the consumer fetch layout and actual values against an exported
+// memexport stream when debugging corrupt skinned geometry.
+void LogVertexFetchConstants(const Memory& memory, const RegisterFile& regs,
+                             const Shader& shader);
+
+// Diagnostic/mitigation: returns true if the first few vertices/instances of
+// any of the draw's vertex bindings contain a non-finite (NaN/Inf) value in
+// guest RAM (i.e. the mesh is fed bad CPU-supplied data and would explode).
+// Logs the offending draw when the log_nonfinite_draws cvar is enabled.
+bool DrawVertexDataHasNonFinite(const Memory& memory, const RegisterFile& regs,
+                                const Shader& shader,
+                                uint32_t* nonfinite_base_out = nullptr);
+
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).
 XE_NOINLINE

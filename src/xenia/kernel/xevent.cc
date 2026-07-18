@@ -57,21 +57,47 @@ void XEvent::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
   assert_not_null(event_);
 }
 
+void XEvent::SyncGuestSignalState(uint32_t state) {
+  // Real Xenon keeps the KEVENT dispatcher header's signal_state accurate.
+  // Xenia only manipulated the host event, leaving the guest field stale at its
+  // KeInitializeEvent value - so guest worker loops that poll the header
+  // directly (a common hand-rolled sync pattern) never saw a Set and could
+  // Reset+Wait past it, losing the wakeup (Fable II worker-pool deadlock).
+  if (guest_object()) {
+    guest_object<X_DISPATCH_HEADER>()->signal_state = state;
+  }
+}
+
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
+  DbgRecordSignal(1);
+  SyncGuestSignalState(1);
   event_->Set();
   return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
+  DbgRecordSignal(2);
+  // Pulse releases waiters then leaves the event non-signaled.
+  SyncGuestSignalState(0);
   event_->Pulse();
   return 1;
 }
 
 int32_t XEvent::Reset() {
+  DbgRecordSignal(3);
+  SyncGuestSignalState(0);
   event_->Reset();
   return 1;
+}
+
+void XEvent::WaitCallback() {
+  // Auto-reset events clear their signal on a satisfied wait; keep the guest
+  // header in sync (manual-reset events stay signaled until an explicit Reset).
+  if (!manual_reset_) {
+    SyncGuestSignalState(0);
+  }
 }
 void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
   auto [type, state] = event_->Query();

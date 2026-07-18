@@ -176,8 +176,12 @@ struct ValueOp : Op<ValueOp<T, KEY_TYPE, REG_TYPE, CONST_TYPE>, KEY_TYPE> {
   const REG_TYPE& reg() const {
     assert_true(!is_constant);
     if (is_constant) {
-      XELOGE("{} - Invalid handling of constant! Report this to developers!",
-             __FUNCTION__);
+      XELOGE(
+          "{} - Invalid handling of constant! Report this to developers! "
+          "(guest opcode {}, guest function {:08X})",
+          __FUNCTION__,
+          GetOpcodeName(static_cast<hir::Opcode>(x64_current_emit_opcode)),
+          x64_current_emit_guest_function);
     }
     return reg_;
   }

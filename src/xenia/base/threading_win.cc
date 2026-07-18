@@ -125,10 +125,14 @@ void set_name(const std::string_view name) {
 // constant and avoid creating a stack variable
 static const LARGE_INTEGER sleepdelay0_for_maybeyield{{0LL}};
 
+bool EnableAboveNormalProcessPriority() {
+  return SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0;
+}
+
 void MaybeYield() {
 #if 0
 #if defined(XE_USE_NTDLL_FUNCTIONS)
-	
+
   NtYieldExecutionPointer.invoke();
 #else
   SwitchToThread();

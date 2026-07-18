@@ -1,0 +1,219 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+// GPU downsample of a resolution-scaled resolve result back to the 1x guest
+// memory layout, so it can be read back to the CPU even while resolution
+// scaling is active (without this, render-to-texture results would never reach
+// guest RAM at >1x, and games that read resolved data on the CPU - such as
+// Fable II's character/dog texture morphs - get stale/zero data and render
+// black textures).
+//
+// This is a nearest-neighbor downscale: for each 1x guest block, the top-left
+// host subpixel (host position = guest position * resolution scale) is copied.
+//
+// The whole thing is just a byte relocation - the scaled resolve copy that
+// produced the source already applied format packing, endian swap, exponent
+// bias, red/blue swap and MSAA resolve, so the bytes are exactly what the guest
+// expects; we only need to move them from the scaled tiled layout to the 1x
+// tiled layout.
+//
+// Addressing is deliberately built on the SAME helpers the scaled resolve copy
+// uses (resolve.xesli's XeResolveDestPixelAddress for the source), so the
+// source offsets are guaranteed to match what the resolve actually wrote into
+// the bound scaled-resolve buffer. The destination uses the 1x (unscaled) tiled
+// address plus the real guest base.
+//
+// Required define before include:
+//   XE_DOWNSAMPLE_BPB_LOG2 - bytes-per-block log2 (0..4 for 8/16/32/64/128bpp).
+// XE_RESOLVE_RESOLUTION_SCALED must be defined (this shader only runs scaled),
+// and XE_RESOLVE_DOWNSAMPLE adds the 1x destination base push constant.
+
+#ifndef XE_DOWNSAMPLE_BPB_LOG2
+  #error resolve_downsample.xesli requires XE_DOWNSAMPLE_BPB_LOG2.
+#endif
+#ifndef XE_RESOLVE_RESOLUTION_SCALED
+  #error resolve_downsample.xesli requires XE_RESOLVE_RESOLUTION_SCALED.
+#endif
+
+#define XE_RESOLVE_DOWNSAMPLE
+// Note: intentionally NOT defining XE_RESOLVE_COPY_EDRAM_BYTE_BUFFER_ALIGNMENT -
+// that would make resolve.xesli declare its own EDRAM source buffer at t0 and
+// pull in the color-load helpers we don't need. We only need XeResolveGetInfo
+// and XeResolveDestPixelAddress, which are always available, and declare our own
+// scaled-resolve source buffer below. 8bpp/16bpp sub-dword source reads are
+// masked out of aligned dwords via byte_buffer_align4_load4_xe.
+#include "resolve.xesli"
+
+// Number of consecutive 1x guest X blocks (and therefore destination bytes) a
+// single thread relocates. Chosen so the destination chunk is exactly the
+// contiguous, aligned run the matching resolve copy shader writes - 8 bytes for
+// 8bpp/16bpp (resolve_full_8bpp/16bpp store 8 bytes), 16 bytes for 32/64/128bpp.
+// Guest tiling only keeps that many consecutive blocks contiguous, so a wider
+// store would scatter bytes to the wrong tiled locations (this is why 16bpp uses
+// 4 blocks, not 8 - an earlier 8-block/16-byte store corrupted 16bpp textures).
+#if XE_DOWNSAMPLE_BPB_LOG2 == 0
+  #define XE_DOWNSAMPLE_BLOCKS_PER_THREAD 8u
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 1
+  #define XE_DOWNSAMPLE_BLOCKS_PER_THREAD 4u
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 2
+  #define XE_DOWNSAMPLE_BLOCKS_PER_THREAD 4u
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 3
+  #define XE_DOWNSAMPLE_BLOCKS_PER_THREAD 2u
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 4
+  #define XE_DOWNSAMPLE_BLOCKS_PER_THREAD 1u
+#else
+  #error Unsupported XE_DOWNSAMPLE_BPB_LOG2.
+#endif
+
+// Source: the resolution-scaled resolve buffer, exactly as bound for the resolve
+// copy (read-only here).
+byte_buffer_align4_declare_xe(xe_downsample_source, set=0, binding=0, t0, space0)
+// Destination: shared memory (the 1x guest mirror), write-only. 8bpp and 16bpp
+// write 8-byte chunks (only that much stays contiguous in guest tiling); 32/64/
+// 128bpp write 16-byte chunks. The SSBO element type must match the store width
+// for the GLSL/SPIR-V path (raw buffers on D3D12 don't care).
+#if XE_DOWNSAMPLE_BPB_LOG2 <= 1
+byte_buffer_align8_wo_declare_xe(xe_downsample_dest, set=1, binding=0, u0,
+                                 space0)
+#else
+byte_buffer_align16_wo_declare_xe(xe_downsample_dest, set=1, binding=0, u0,
+                                  space0)
+#endif
+
+// 1x (unscaled) tiled byte address of a guest block within the resolve region,
+// plus the real guest destination base.
+uint XeDownsampleDestAddress(XeResolveInfo resolve_info,
+                             uint2_xe guest_position_in_region,
+                             uint dest_base) {
+  uint2_xe guest_position =
+      guest_position_in_region +
+      resolve_info.dest_xy_offset_scaled / resolve_info.resolution_scale;
+  uint address;
+  dont_flatten_xe if (resolve_info.dest_is_array) {
+    address = uint(XenosTextureTiledAddress3D(
+        int3_xe(uint3_xe(guest_position, resolve_info.dest_slice)),
+        resolve_info.dest_row_pitch_macro_tiles,
+        resolve_info.dest_slice_pitch_3d_macro_tiles, XE_DOWNSAMPLE_BPB_LOG2));
+  } else {
+    address = uint(XenosTextureTiledAddress2D(
+        int2_xe(guest_position), resolve_info.dest_row_pitch_macro_tiles,
+        XE_DOWNSAMPLE_BPB_LOG2));
+  }
+  return address + dest_base;
+}
+
+// Loads one block (1 << XE_DOWNSAMPLE_BPB_LOG2 bytes) from the scaled source,
+// returned in the low bits of a uint for <= 32bpp, or as more components.
+#define LOCAL_SIZE_X_XE 64
+#define LOCAL_SIZE_Y_XE 1
+#define LOCAL_SIZE_Z_XE 1
+entry_bindings_begin_compute_xe
+  XE_RESOLVE_PUSH_CONST_BINDING
+  entry_binding_next_xe
+  byte_buffer_wo_binding_xe(xe_downsample_dest, buffer(1))
+  entry_binding_next_xe
+  byte_buffer_binding_xe(xe_downsample_source, buffer(2))
+entry_bindings_end_inputs_begin_compute_xe
+  entry_in_global_thread_id_xe
+entry_inputs_end_code_begin_compute_xe
+{
+  XeResolveInfo resolve_info = XeResolveGetInfo(pass_push_consts_xe);
+
+  // Guest (1x) region dimensions. width_div_8_scaled is the scaled width in
+  // blocks / 8; divide by the X scale to get the unscaled width.
+  uint guest_width =
+      (resolve_info.width_div_8_scaled / resolve_info.resolution_scale.x) << 3u;
+
+  uint2_xe block_index =
+      in_global_thread_id_xe.xy *
+      uint2_xe(XE_DOWNSAMPLE_BLOCKS_PER_THREAD, 1u);
+  dont_flatten_xe if (block_index.x >= guest_width) {
+    return;
+  }
+
+  uint dest_base = push_const_xe(xe_resolve_downsample_dest_base);
+  uint dest_address =
+      XeDownsampleDestAddress(resolve_info, block_index, dest_base);
+
+#if XE_DOWNSAMPLE_BPB_LOG2 == 2
+  // 32bpp: 4 blocks -> 16 bytes.
+  uint4_xe packed;
+  unroll_xe
+  for (uint i = 0u; i < 4u; ++i) {
+    uint source_address = XeResolveDestPixelAddress(
+        resolve_info,
+        (block_index + uint2_xe(i, 0u)) * resolve_info.resolution_scale,
+        XE_DOWNSAMPLE_BPB_LOG2);
+    packed[i] =
+        byte_buffer_align4_load4_xe(xe_downsample_source, source_address);
+  }
+  byte_buffer_align16_store16_xe(xe_downsample_dest, dest_address, packed);
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 3
+  // 64bpp: 2 blocks -> 16 bytes.
+  uint4_xe packed;
+  unroll_xe
+  for (uint i = 0u; i < 2u; ++i) {
+    uint source_address = XeResolveDestPixelAddress(
+        resolve_info,
+        (block_index + uint2_xe(i, 0u)) * resolve_info.resolution_scale,
+        XE_DOWNSAMPLE_BPB_LOG2);
+    uint2_xe block =
+        byte_buffer_align4_load8u_xe(xe_downsample_source, source_address);
+    packed[i * 2u] = block.x;
+    packed[i * 2u + 1u] = block.y;
+  }
+  byte_buffer_align16_store16_xe(xe_downsample_dest, dest_address, packed);
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 4
+  // 128bpp: 1 block -> 16 bytes.
+  uint source_address = XeResolveDestPixelAddress(
+      resolve_info, block_index * resolve_info.resolution_scale,
+      XE_DOWNSAMPLE_BPB_LOG2);
+  uint4_xe packed =
+      byte_buffer_align4_load16u_xe(xe_downsample_source, source_address);
+  byte_buffer_align16_store16_xe(xe_downsample_dest, dest_address, packed);
+#elif XE_DOWNSAMPLE_BPB_LOG2 == 1
+  // 16bpp: 4 blocks -> 8 bytes (guest tiling only keeps 4 consecutive 16bpp
+  // blocks contiguous, matching resolve_full_16bpp's 8-byte store). Blocks are
+  // 2 bytes, possibly 2-aligned, so extract the right halfword from an aligned
+  // dword.
+  uint2_xe packed = uint2_xe(0u, 0u);
+  unroll_xe
+  for (uint i = 0u; i < 4u; ++i) {
+    uint source_address = XeResolveDestPixelAddress(
+        resolve_info,
+        (block_index + uint2_xe(i, 0u)) * resolve_info.resolution_scale,
+        XE_DOWNSAMPLE_BPB_LOG2);
+    uint dword =
+        byte_buffer_align4_load4_xe(xe_downsample_source, source_address & ~3u);
+    uint halfword = (dword >> ((source_address & 2u) << 3u)) & 0xFFFFu;
+    if ((i & 1u) == 0u) {
+      packed[i >> 1u] = halfword;
+    } else {
+      packed[i >> 1u] |= halfword << 16u;
+    }
+  }
+  byte_buffer_align8_store8_xe(xe_downsample_dest, dest_address, packed);
+#else
+  // 8bpp: 8 blocks -> 8 bytes. Blocks are 1 byte, extract from an aligned dword.
+  uint2_xe packed = uint2_xe(0u, 0u);
+  unroll_xe
+  for (uint i = 0u; i < 8u; ++i) {
+    uint source_address = XeResolveDestPixelAddress(
+        resolve_info,
+        (block_index + uint2_xe(i, 0u)) * resolve_info.resolution_scale,
+        XE_DOWNSAMPLE_BPB_LOG2);
+    uint dword =
+        byte_buffer_align4_load4_xe(xe_downsample_source, source_address & ~3u);
+    uint byte_value = (dword >> ((source_address & 3u) << 3u)) & 0xFFu;
+    packed[i >> 2u] |= byte_value << ((i & 3u) << 3u);
+  }
+  byte_buffer_align8_store8_xe(xe_downsample_dest, dest_address, packed);
+#endif
+}
+entry_code_end_compute_xe

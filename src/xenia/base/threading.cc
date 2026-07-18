@@ -12,6 +12,9 @@
 namespace xe {
 namespace threading {
 
+std::atomic<uint64_t> g_db16cyc_spin_count{0};
+std::atomic<uint64_t> g_dispatch_seq{0};
+
 uint32_t logical_processor_count() {
   static uint32_t value = 0;
   if (!value) {

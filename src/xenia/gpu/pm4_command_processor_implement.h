@@ -913,7 +913,17 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
     }
   }
-  xe::store(write_destination, data_value);
+  // This is the fence/timestamp the guest polls to learn the GPU reached this
+  // point - so any deferred resolve readback must land in guest RAM before the
+  // value becomes visible, otherwise the guest reads its morph data stale. The
+  // default implementation flushes readbacks synchronously and returns false so
+  // we store the value here; the "deferred" readback mode instead takes over the
+  // store (returns true) and performs it later, once the readback's GPU work has
+  // completed on its own, without stalling the command processor now.
+  if (!COMMAND_PROCESSOR::HandleFenceWriteWithReadback(write_destination,
+                                                       data_value)) {
+    xe::store(write_destination, data_value);
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1136,11 +1146,16 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
+    // A visibility-query pass with kill_pix_post_hi_z produces no pixels, so it
+    // is normally dropped. But if the vertex shader performs memory exports
+    // (e.g. Fable II's GPU vertex skinning), the export is a side effect that
+    // later draws read back - dropping it leaves the consumer fetching stale
+    // data, which makes geometry flicker and explode. Keep running such draws.
+    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z) ||
+        COMMAND_PROCESSOR::ActiveVertexShaderHasMemexport()) {
+      // TODO(Triang3l || JoelLinn): Handle the pixel kill properly in the
+      // render backends (rasterization should still be suppressed for the
+      // memexport-only case).
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
           vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
           is_indexed ? &index_buffer_info : nullptr,

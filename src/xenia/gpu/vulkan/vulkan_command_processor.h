@@ -272,7 +272,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                      uint32_t num_registers) override;
 
-  void OnGammaRamp256EntryTableValueWritten() override;
+  void OnGammaRamp256EntryTableValueWritten(bool wrapped_to_start) override;
   void OnGammaRampPWLValueWritten() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,

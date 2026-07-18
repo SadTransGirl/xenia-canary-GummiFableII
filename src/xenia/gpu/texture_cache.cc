@@ -52,14 +52,20 @@ DEFINE_uint32(
     "will be destroyed as soon as possible.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_memory_limit_render_to_texture, 24,
+    texture_cache_memory_limit_render_to_texture, 64,
     "Part of the host texture memory budget (in megabytes) that will be scaled "
     "by the current drawing resolution scale.\n"
-    "If texture_cache_memory_limit_soft, for instance, is 384, and this is 24, "
-    "it will be assumed that the game will be using roughly 24 MB of "
-    "render-to-texture (resolve) targets and 384 - 24 = 360 MB of regular "
-    "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
-    "96 MB, and with 3x3, it will be 360 + 216 MB.",
+    "If texture_cache_memory_limit_soft, for instance, is 384, and this is 64, "
+    "it will be assumed that the game will be using roughly 64 MB of "
+    "render-to-texture (resolve) targets and 384 - 64 = 320 MB of regular "
+    "textures - so with 2x2 resolution scaling, the soft limit will be 320 + "
+    "256 MB, and with 3x3, it will be 320 + 576 MB.\n"
+    "This only adds cache headroom at resolution scales above 1x (the scaled "
+    "add term is multiplied by scale_area - 1, so it is 0 at 1x and leaves 1x "
+    "behavior unchanged); raising it reduces texture eviction/reload churn that "
+    "can cause flickering when the camera moves at higher scales, at the cost "
+    "of more video memory. Lower it if a high resolution scale runs out of "
+    "video memory.",
     "GPU");
 DEFINE_bool(tiled_shared_memory, true,
             "Enable tiled/sparse resources for efficient large address space "

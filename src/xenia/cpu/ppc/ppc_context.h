@@ -430,6 +430,18 @@ typedef struct alignas(64) PPCContext_s {
   ThreadState* thread_state;
   uint8_t* virtual_membase;
 
+  // Incremented once per guest db16cyc spin-pause by the x64 backend's spin
+  // handler. The kernel's ~20ms scheduler tick reads the per-tick delta to
+  // detect a sustained spinner and demote its host priority so the starved
+  // game-logic thread preempts it (cpu_starvation_mitigation). Single-writer
+  // (the owning thread); cross-thread reads by the tick are a benign race.
+  // Padded to a full 64-byte block so sizeof(PPCContext) stays % 64 == 0.
+  uint32_t spin_activity;
+  // Guest LR observed on the most recent db16cyc spin-pause - identifies WHICH
+  // guest function a busy-wait loop is spinning in (deadlock diagnostics).
+  uint32_t spin_last_lr32;
+  uint8_t _pad_spin_activity[56];
+
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {
     static_assert(std::is_pointer_v<T>);

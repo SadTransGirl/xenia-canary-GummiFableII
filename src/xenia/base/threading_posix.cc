@@ -148,6 +148,11 @@ void MaybeYield() {
   __sync_synchronize();
 }
 
+bool EnableAboveNormalProcessPriority() {
+  // Best-effort: a negative nice value raises priority (requires privileges).
+  return setpriority(PRIO_PROCESS, 0, -5) == 0;
+}
+
 void SyncMemory() { __sync_synchronize(); }
 
 void Sleep(std::chrono::microseconds duration) {

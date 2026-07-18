@@ -463,6 +463,52 @@ class XThread : public XObject, public cpu::Thread {
   // simply restored to base_priority.
   void BoostOnWake(int32_t increment);
 
+  // Called by the ~20ms scheduler tick in place of CheckQuantumAndDecay when
+  // cpu_starvation_mitigation is on. Reads this thread's db16cyc spin activity
+  // since the last tick; if it has been spinning hard (a sustained busy-wait
+  // that would starve the game-logic thread under host oversubscription), it
+  // demotes the host thread priority to lowest so the scheduler preempts it in
+  // favour of any non-spinning thread. When it stops spinning, the normal host
+  // priority is restored and quantum decay resumes. This guarantees the logic
+  // thread wins via hard OS preemption rather than relying on a spinner's yield
+  // landing on the right thread. Falls back to CheckQuantumAndDecay otherwise.
+  void UpdateSpinScheduling();
+
+  // Diagnostics for log_thread_stall_stats: raw per-thread db16cyc spin counter
+  // and whether this thread is currently host-priority-demoted for spinning.
+  uint32_t spin_activity_raw() const;
+  bool spin_demoted() const { return spin_demoted_; }
+  cpu::ThreadState* thread_state() const { return thread_state_; }
+
+  // Deadlock diagnostics (set by XObject::Wait/WaitMultiple around the blocking
+  // host wait): which kernel object this thread is currently blocked on, its
+  // type, the wait_reason, and when the wait started. dbg_wait_object_ == 0
+  // means the thread is not currently in a tracked wait. dbg_wait_xobject_ is
+  // the host object pointer, used by the stall dump to read the object's
+  // last-signal record; only dereferenced while the thread is waiting on it
+  // (the object is pinned by the wait) and only for reading atomics.
+  std::atomic<uint64_t> dbg_wait_object_{0};
+  std::atomic<uint32_t> dbg_wait_type_{0};
+  std::atomic<uint32_t> dbg_wait_reason_{0};
+  std::atomic<uint64_t> dbg_wait_start_ms_{0};
+  std::atomic<XObject*> dbg_wait_xobject_{nullptr};
+  // Guest LR at the moment this thread entered the blocking wait - points just
+  // after the KeWaitForSingleObject call in the worker loop, so the loop's
+  // reset/condition-check protocol can be disassembled.
+  std::atomic<uint32_t> dbg_wait_lr_{0};
+  // For WaitMultiple: ALL objects of the wait (WaitAll blocks on the one
+  // unsatisfied object, which objects[0] alone can't reveal - seen with Fable
+  // II's thread 07 blocked in a WaitAll whose logged first event WAS signaled).
+  // Elements are written before count is published; count=0 = no multi-wait.
+  static constexpr uint32_t kDbgMaxMultiWait = 8;
+  std::atomic<uint32_t> dbg_wait_multi_count_{0};
+  std::atomic<uint32_t> dbg_wait_multi_addr_[kDbgMaxMultiWait] = {};
+  std::atomic<XObject*> dbg_wait_multi_xobj_[kDbgMaxMultiWait] = {};
+
+  // Guest LR of the most recent db16cyc spin-pause on this thread - which
+  // guest function a busy-wait loop is spinning in (0 if never spun).
+  uint32_t spin_last_lr() const;
+
   // Xbox thread IDs:
   // 0 - core 0, thread 0 - user
   // 1 - core 0, thread 1 - user
@@ -536,6 +582,10 @@ class XThread : public XObject, public cpu::Thread {
   int32_t base_priority_ = 0;  // priority floor — decay never goes below this
   int32_t boost_amount_ = 0;   // accumulated priority boost above base
   uint64_t quantum_start_ms_ = 0;  // host uptime (ms) when quantum last reset
+  // Spin-demotion state (UpdateSpinScheduling): last observed db16cyc spin
+  // counter, and whether this thread is currently host-priority-demoted.
+  uint32_t spin_activity_baseline_ = 0;
+  bool spin_demoted_ = false;
 
 #if !XE_PLATFORM_WIN32
   // Condition variable for thread self-suspension.

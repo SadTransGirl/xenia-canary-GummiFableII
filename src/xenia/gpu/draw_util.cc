@@ -13,11 +13,62 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/texture_address.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/ui/graphics_util.h"
+
+// Diagnostic: logs every memexport stream's decision (base address, index
+// count, format, computed byte size) and why a stream is skipped. Use this to
+// investigate memexport-driven geometry corruption (e.g. Fable II's exploding
+// dog/character mesh): a stream that is silently skipped here, or sized wrong,
+// leaves the consuming vertex fetch reading stale memory. Off by default - it
+// logs per draw and is noisy.
+DEFINE_bool(log_memexport_ranges, false,
+            "Log GPU memory export (memexport) stream ranges and skip reasons "
+            "for diagnosing memexport-driven geometry corruption.",
+            "GPU");
+
+DEFINE_bool(
+    log_fp10_resolve_clamp, false,
+    "Log every resolve of a k_2_10_10_10_FLOAT (FP10, [0,32) HDR) EDRAM "
+    "render target to a texture, with the destination copy format and "
+    "address. The destination format enum has no float variant, so this "
+    "resolve always hard-clamps HDR values above 1.0 via a plain UNORM "
+    "saturate - used to confirm whether Fable II's moon halo draws into an "
+    "FP10 target that gets resolved this way. For debugging only.",
+    "GPU");
+
+// Companion to log_memexport_ranges for the CONSUMER side: logs the vertex
+// fetch layout (base address, endianness, stride, per-attribute format) of
+// draws that read memexport-produced vertices. To diagnose exploding skinned
+// meshes (e.g. Fable II's dog), enable both and find the consumer binding whose
+// base address matches an exported stream's base - then compare the export
+// format/endianness against the fetch format/endianness. A mismatch (commonly
+// endianness on the position attribute) is what scatters the vertices.
+DEFINE_bool(log_vertex_fetch_constants, false,
+            "Log per-draw vertex fetch constants (base address, endianness, "
+            "stride, attribute formats) for diagnosing geometry corruption, "
+            "especially memexport-skinned meshes. Noisy; logs every draw.",
+            "GPU");
+
+DEFINE_bool(log_nonfinite_draws, false,
+            "Log a draw whose guest vertex data contains a non-finite (NaN/Inf) "
+            "value in its first vertices/instances - identifies meshes that "
+            "explode because the game's CPU-supplied transform data is bad "
+            "(e.g. Fable II's dog). Logs the vertex shader hash and binding so "
+            "the offending draw can be pinpointed.",
+            "GPU");
+
+DEFINE_bool(skip_nonfinite_draws, false,
+            "Skip drawing a (non-memexport) mesh whose guest vertex data "
+            "contains a non-finite (NaN/Inf) value, so geometry fed bad "
+            "CPU-supplied transform data vanishes for that frame instead of "
+            "exploding across the screen (e.g. Fable II's dog). Mitigation "
+            "only - does not fix the underlying bad data. Off by default.",
+            "GPU");
 
 // Very prominent in 545407F2.
 DEFINE_bool(
@@ -787,6 +838,16 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
     // IPR2015-00325 sequencer specification.
     if (stream.const_0x1 != 0x1 || stream.const_0x4b0 != 0x4B0 ||
         stream.const_0x96 != 0x96 || !stream.index_count) {
+      if (cvars::log_memexport_ranges) {
+        XELOGI(
+            "Memexport stream (constant {}) skipped: failed validation "
+            "(const_0x1={:#x}, const_0x4b0={:#x}, const_0x96={:#x}, "
+            "index_count={}). If geometry is corrupt, a needed export may be "
+            "getting dropped here.",
+            constant_index, uint32_t(stream.const_0x1),
+            uint32_t(stream.const_0x4b0), uint32_t(stream.const_0x96),
+            uint32_t(stream.index_count));
+      }
       continue;
     }
     const FormatInfo& format_info =
@@ -830,7 +891,169 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
     if (!range_reused) {
       ranges_out.emplace_back(uint32_t(stream.base_address), stream_size_bytes);
     }
+    if (cvars::log_memexport_ranges) {
+      XELOGI(
+          "Memexport stream (constant {}): base={:#010x}, index_count={}, "
+          "format={}, bpp={}, endian={}, num_format={}, red_blue_swap={}, "
+          "size={} bytes{}.",
+          constant_index, uint32_t(stream.base_address) << 2,
+          uint32_t(stream.index_count),
+          FormatInfo::GetName(format_info.format), format_info.bits_per_pixel,
+          uint32_t(stream.endianness), uint32_t(stream.num_format),
+          uint32_t(stream.red_blue_swap), stream_size_bytes,
+          range_reused ? " (merged into existing range)" : "");
+    }
   }
+}
+
+void LogVertexFetchConstants(const Memory& memory, const RegisterFile& regs,
+                             const Shader& shader) {
+  if (!cvars::log_vertex_fetch_constants) {
+    return;
+  }
+  // Log every vertex binding's fetch constant and attribute layout so the
+  // consumer side of a memexport-skinned mesh can be compared against the
+  // exported stream (match on base address, then compare format/endianness).
+  for (const Shader::VertexBinding& binding : shader.vertex_bindings()) {
+    xenos::xe_gpu_vertex_fetch_t fetch =
+        regs.GetVertexFetch(binding.fetch_constant);
+    uint32_t base_bytes = uint32_t(fetch.address) << 2;
+    XELOGI(
+        "Vertex fetch: VS={:016X} fetch_constant={} base={:#010x} "
+        "endian={} size_words={} binding_stride_words={}",
+        shader.ucode_data_hash(), binding.fetch_constant, base_bytes,
+        uint32_t(fetch.endian), uint32_t(fetch.size), binding.stride_words);
+    for (const Shader::VertexBinding::Attribute& attribute :
+         binding.attributes) {
+      const ParsedVertexFetchInstruction::Attributes& attr =
+          attribute.fetch_instr.attributes;
+      XELOGI(
+          "  attr: data_format={} offset_words={} stride_words={} "
+          "exp_adjust={} signed={} integer={}",
+          uint32_t(attr.data_format), attr.offset, attr.stride,
+          attr.exp_adjust, attr.is_signed ? 1 : 0, attr.is_integer ? 1 : 0);
+    }
+    // Dump the raw bytes of the first few vertices straight from guest RAM so
+    // the actual exported values can be inspected (with readback_memexport=true
+    // the GPU-exported data is present here). Each dword is shown as the stored
+    // hex and as a float with the stored bytes reversed (matching how a k8in32
+    // 32-bit fetch un-swaps them), to spot NaN/garbage/zero positions.
+    uint32_t stride_words = binding.stride_words ? binding.stride_words : 1;
+    if (base_bytes && base_bytes < 0x20000000) {
+      const uint8_t* phys = memory.TranslatePhysical(base_bytes);
+      if (phys) {
+        uint32_t verts_to_dump = std::min(uint32_t(4), uint32_t(fetch.size) /
+                                                            stride_words);
+        for (uint32_t v = 0; v < verts_to_dump; ++v) {
+          StringBuffer line;
+          line.AppendFormat("  vtx[{}]:", v);
+          for (uint32_t w = 0; w < stride_words; ++w) {
+            const void* p = phys + (v * stride_words + w) * sizeof(uint32_t);
+            uint32_t raw = xe::load<uint32_t>(p);
+            float f = xe::load_and_swap<float>(p);
+            line.AppendFormat(" [{}]={:08x}({:g})", w, raw, f);
+          }
+          XELOGI("{}", line.to_string_view());
+        }
+      }
+    }
+  }
+}
+
+bool DrawVertexDataHasNonFinite(const Memory& memory, const RegisterFile& regs,
+                                const Shader& shader,
+                                uint32_t* nonfinite_base_out) {
+  // Scan the first few vertices/instances of each vertex binding straight from
+  // guest RAM for a non-finite (NaN/Inf) float - i.e. an IEEE-754 32-bit value
+  // with all exponent bits set. Exploding meshes are fed transform/position
+  // data the game's CPU left non-finite (e.g. Fable II's dog), visible in the
+  // first elements. ONLY 32-bit-float-format attributes are checked: packed
+  // formats (colors, normals, indices) routinely have the exponent-bits-set
+  // pattern without being floats, so checking raw words gives false positives.
+  constexpr uint32_t kElementsToCheck = 4;
+  for (const Shader::VertexBinding& binding : shader.vertex_bindings()) {
+    xenos::xe_gpu_vertex_fetch_t fetch =
+        regs.GetVertexFetch(binding.fetch_constant);
+    if (fetch.type != xenos::FetchConstantType::kVertex) {
+      continue;
+    }
+    uint32_t base_bytes = uint32_t(fetch.address) << 2;
+    if (!base_bytes || base_bytes >= 0x20000000) {
+      continue;
+    }
+    uint32_t stride_words = binding.stride_words ? binding.stride_words : 1;
+    const uint8_t* phys = memory.TranslatePhysical(base_bytes);
+    if (!phys) {
+      continue;
+    }
+    uint32_t total_words = uint32_t(fetch.size);
+    bool swap = fetch.endian != xenos::Endian::kNone;
+    uint32_t elements = std::min(kElementsToCheck, total_words / stride_words);
+    for (const Shader::VertexBinding::Attribute& attribute :
+         binding.attributes) {
+      const ParsedVertexFetchInstruction::Attributes& attr =
+          attribute.fetch_instr.attributes;
+      // Only full-precision float formats can be meaningfully tested for the
+      // IEEE non-finite pattern.
+      uint32_t component_count;
+      switch (attr.data_format) {
+        case xenos::VertexFormat::k_32_FLOAT:
+          component_count = 1;
+          break;
+        case xenos::VertexFormat::k_32_32_FLOAT:
+          component_count = 2;
+          break;
+        case xenos::VertexFormat::k_32_32_32_FLOAT:
+          component_count = 3;
+          break;
+        case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+          component_count = 4;
+          break;
+        default:
+          continue;
+      }
+      if (attr.offset < 0) {
+        continue;
+      }
+      uint32_t attr_offset_words = uint32_t(attr.offset);
+      for (uint32_t e = 0; e < elements; ++e) {
+        for (uint32_t c = 0; c < component_count; ++c) {
+          uint32_t word_index = e * stride_words + attr_offset_words + c;
+          if (word_index >= total_words) {
+            break;
+          }
+          const void* p = phys + word_index * sizeof(uint32_t);
+          uint32_t value =
+              swap ? xe::load_and_swap<uint32_t>(p) : xe::load<uint32_t>(p);
+          // Non-finite (all exponent bits set) OR absurdly huge finite
+          // (|v| >= 2^60 ~= 1.15e18, far above any legitimate vertex
+          // coordinate). A mesh fed garbage transform data can explode from a
+          // huge-but-finite position just as much as from an Inf/NaN one, and
+          // the Inf-only test misses those (e.g. Fable II's dog, whose
+          // memexport-skinned positions come out huge-finite, not Inf).
+          bool is_nonfinite = (value & 0x7F800000u) == 0x7F800000u;
+          bool is_huge = (value & 0x7FFFFFFFu) >= 0x5D800000u;
+          if (is_nonfinite || is_huge) {
+            if (cvars::log_nonfinite_draws) {
+              XELOGW(
+                  "Non-finite draw: VS={:016X} fetch_constant={} base={:#010x} "
+                  "format={} element={} attr_offset={} comp={} value={:08x} "
+                  "({}) (garbage float in vertex/transform data - this mesh "
+                  "would explode)",
+                  shader.ucode_data_hash(), binding.fetch_constant, base_bytes,
+                  uint32_t(attr.data_format), e, attr_offset_words, c, value,
+                  is_nonfinite ? "non-finite" : "huge");
+            }
+            if (nonfinite_base_out) {
+              *nonfinite_base_out = base_bytes;
+            }
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
 }
 
 XE_NOINLINE
@@ -1325,6 +1548,14 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
   bool is_depth = IsCopyingDepth();
   ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
   bool source_is_64bpp = !is_depth && color_edram_info.format_is_64bpp != 0;
+  if (cvars::log_fp10_resolve_clamp && !is_depth &&
+      xenos::ColorRenderTargetFormat(color_edram_info.format) ==
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
+    XELOGW(
+        "FP10 resolve: dest_format={} dest_base=0x{:08X} dest_pitch_px={}",
+        uint32_t(copy_dest_info.copy_dest_format), copy_dest_base,
+        copy_dest_coordinate_info.pitch_aligned_div_32 * 32);
+  }
   if (is_depth || (!copy_dest_info.copy_dest_exp_bias &&
                    xenos::IsSingleCopySampleSelected(
                        copy_dest_coordinate_info.copy_sample_select) &&

@@ -3273,7 +3273,38 @@ struct SET_ROUNDING_MODE_I32
 };
 EMITTER_OPCODE_TABLE(OPCODE_SET_ROUNDING_MODE, SET_ROUNDING_MODE_I32);
 
-static void MaybeYieldForwarder(void* ctx) { xe::threading::MaybeYield(); }
+// db16cyc is the guest spin-pause, used pervasively in guest spinlocks/busy-
+// waits that never enter a kernel function we could otherwise hook; by default
+// it emits x86 `pause`, which does not yield, so under host oversubscription a
+// spinning guest thread can starve the game-logic thread and livelock state
+// (Fable II NPC/character freezes) while audio/GPU keep running.
+//
+// Two ingredients are BOTH required (confirmed empirically - dropping either
+// lets it freeze under stress):
+//  - MaybeYield() on most spins hands the core to another *runnable Xenia
+//    thread* (the logic thread) under same-process oversubscription. It is
+//    cheap when there is no contention (returns immediately when nothing else
+//    is ready), so normal-play fps is largely unaffected.
+//  - A real NanoSleep() every 128th spin removes a *sustained* spinner from the
+//    runnable set entirely, which is what wins the core back under CROSS-process
+//    load (with Xenia at above-normal process priority via
+//    cpu_starvation_mitigation) where a bare Sleep(0)/MaybeYield would just cede
+//    to the other app.
+static void MaybeYieldForwarder(void* ctx) {
+  xe::threading::g_db16cyc_spin_count.fetch_add(1, std::memory_order_relaxed);
+  // Per-thread spin attribution for the kernel scheduler's spin-demotion (ctx
+  // is this thread's PPCContext - see EmitGuestToHostThunk). Also record the
+  // guest LR so diagnostics can see WHICH guest function is busy-waiting.
+  auto* ppc_ctx = reinterpret_cast<ppc::PPCContext*>(ctx);
+  ++ppc_ctx->spin_activity;
+  ppc_ctx->spin_last_lr32 = uint32_t(ppc_ctx->lr);
+  static thread_local uint32_t spin_count = 0;
+  if ((++spin_count & 0x7F) == 0) {
+    xe::threading::NanoSleep(50000);  // 50us; deschedules a sustained spinner
+  } else {
+    xe::threading::MaybeYield();
+  }
+}
 // ============================================================================
 // OPCODE_DELAY_EXECUTION
 // ============================================================================
