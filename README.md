@@ -1,75 +1,131 @@
-<p align="center">
-    <a href="https://github.com/xenia-canary/xenia-canary/tree/canary_experimental/assets/icon">
-        <img height="256px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
-    </a>
-</p>
+<h1 align="center">Xenia Canary — Fable II (GummiFableII build)</h1>
 
-<h1 align="center">Xenia Canary - Xbox 360 Emulator</h1>
+A tuned fork of [Xenia Canary](https://github.com/xenia-canary/xenia-canary)
+focused on running **Fable II** smoothly at scaled resolution. It ships with
+performance tuning, Fable II-specific bug fixes, ready-made config presets, and
+the game patches already set up.
 
-Xenia Canary is an experimental fork of the Xenia emulator. For more information, see the
-[Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki).
+> This is an unofficial personal build. For general Xenia usage, the
+> [Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki) still
+> applies.
 
-Come chat with us about **emulator-related topics** on [Discord](https://discord.gg/Q9mxZf9).
-For developer chat join `#dev` but stay on topic. Lurking is not only fine, but encouraged!
-Please check the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page before asking questions.
-We've got jobs/lives/etc, so don't expect instant answers.
+---
 
-Discussing illegal activities will get you banned.
+## What's in this build
 
-## Status
+- **Performance tuning** — CPU/JIT, Windows, and GPU-readback settings tuned so
+  Fable II holds framerate at 2x resolution.
+- **Fable II fixes** — black-dog/morph textures, the moon-halo disc bug, a combat
+  hard-crash, a worker-pool freeze, and NPC-freeze mitigations.
+- **Config presets** — native/2x resolution × CAS/FSR sharpening (see below).
+- **Patches** — Fable II (GOTY / Platinum Edition) patches in `patches/`.
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Canary (🪟, 🐧) | [![CI](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental)](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/xenia-canary/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/xenia-canary/xenia-canary/releases/latest) ◦ [All](https://github.com/xenia-canary/xenia-canary/releases) ◦ [Old](https://github.com/xenia-canary/xenia-canary-releases/releases)
+A full, setting-by-setting explanation of every change is in
+[CHANGES.md](CHANGES.md). Read that if you want to know *why* each setting is on.
 
-### Experimental Netplay
+---
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Windows | [![Codacy Badge](https://app.codacy.com/project/badge/Grade/d814c4b6aa444dcc9c1631e0224b2739)](https://app.codacy.com/gh/AdrianCassar/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/AdrianCassar/xenia-canary/releases/latest)
+## Requirements
 
-## Quickstart
+- Windows 10/11, 64-bit.
+- A GPU with Direct3D 12 (or Vulkan) support.
+- **Your own legally-dumped copy of Fable II.** No game files are included here,
+  and none will be provided — see the disclaimer at the bottom.
 
-See the [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart) page.
+---
 
-## FAQ
+## Getting it running
 
-See the [frequently asked questions](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page.
+### Option A — use the release build (recommended)
 
-## Game Compatibility
+1. Download the release `.zip` from the
+   [Releases](https://github.com/SadTransGirl/xenia-canary-GummiFableII/releases)
+   page.
+2. Extract it to a folder of its own (e.g. `C:\Games\XeniaFableII\`). You should
+   have:
+   - `xenia_canary.exe`
+   - `xenia-canary.config.toml`  ← the active config (2x + CAS by default)
+   - `xenia-canary.x1-fsr.config.toml`  ← alternate preset (native + FSR)
+   - `patches\`  ← Fable II patches, already in place
+3. Run **`xenia_canary.exe`** and open your Fable II dump
+   (**File → Open**, or drag the game onto the window).
 
-See the [Game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
-for currently tracked games, and feel free to contribute your own updates,
-screenshots, and information there following the [existing conventions](https://github.com/xenia-canary/game-compatibility/blob/canary/README.md).
+That's it — the included config and patches are picked up automatically.
 
-## Building
+### Option B — build from source
 
-See [building.md](docs/building.md) for setup and information about the
-`xb` script. When writing code, check the [style guide](docs/style_guide.md)
-and be sure to run clang-format!
+See [docs/building.md](docs/building.md) for the full toolchain setup and the
+`xb` build script. In short:
 
-## Contributors Wanted!
+```
+xb setup
+xb build --config=Release
+```
 
-Have some spare time, know advanced C++, and want to write an emulator?
-Contribute! There's a ton of work that needs to be done, a lot of which
-is wide open greenfield fun.
+The build lands in `build\bin\Windows\Release\`. Copy a config preset from
+[`configs/`](configs/) next to the exe as `xenia-canary.config.toml`.
 
-**For general rules and guidelines please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).**
+---
 
-Fixes and optimizations are always welcome (please!), but in addition to
-that there are some major work areas still untouched:
+## Choosing a config preset
 
-* Help work through [missing functionality/bugs in games](https://github.com/xenia-canary/xenia-canary/labels/compat)
-* Reduce the size of Xenia's [huge log files](https://github.com/xenia-canary/xenia-canary/issues/1526)
-* Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-canary/xenia-canary/labels/platform-linux)
+Presets live in [`configs/`](configs/). **To switch presets, copy the one you
+want next to `xenia_canary.exe` and rename it to `xenia-canary.config.toml`**
+(replace the existing one). Xenia loads that file on startup.
 
-See more projects [good for contributors](https://github.com/xenia-canary/xenia-canary/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
-something.
+| Preset | Render resolution | Sharpening | Best for |
+|---|---|---|---|
+| `xenia-canary.x1-cas.config.toml` | Native (720p) | CAS | Lowest GPU load, crisp at native. |
+| `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display. |
+| `xenia-canary.x2-cas.config.toml` | 2× | CAS | **Recommended** — sharp 2× with low overhead. |
+| `xenia-canary.x2-fsr.config.toml` | 2× | FSR | 2× with FSR sharpening. |
+
+All presets share the same performance settings and fixes — only the render
+scale and the sharpener differ.
+
+**Tune for your setup:** open the active `xenia-canary.config.toml` and set
+`framerate_limit` to *your* monitor's refresh rate (e.g. `60`, `144`, `165`).
+This bounds how far ahead the CPU runs and fixes floaty/laggy camera feel.
+
+---
+
+## Patches
+
+The `patches/` folder contains the Fable II patch files:
+
+- `4D5307F1 - Fable II (GOTY_Platinum Edition).patch.toml`
+- `4D5307F1 - Fable II (GOTY_Platinum Edition, TU1).patch.toml`
+
+They're enabled by default (`apply_patches = true` in the config). Keep the
+`patches\` folder next to `xenia_canary.exe`.
+
+---
+
+## Troubleshooting
+
+- **A character/dog goes black at 2× res** — this is the morph-readback region,
+  which can be game-version specific. Enable `log_resolve_readback` in the config
+  to find your version's address range, then set `readback_resolve_only_dest_bases`
+  accordingly. Details in [CHANGES.md](CHANGES.md#fable-ii-fixes).
+- **High FPS but the camera feels floaty** — set `framerate_limit` to your
+  monitor's refresh rate.
+- **Stutter / low FPS at 2×** — try the `x1-fsr` preset (native render, upscaled).
+
+---
+
+## Credits
+
+- Built on [Xenia Canary](https://github.com/xenia-canary/xenia-canary) and the
+  original [Xenia](https://github.com/xenia-project/xenia) project — all credit
+  for the emulator itself goes to their contributors.
+- Fable II tuning, fixes, and presets in this fork by
+  [SadTransGirl](https://github.com/SadTransGirl).
+
+---
 
 ## Disclaimer
 
-The goal of this project is to experiment, research, and educate on the topic
-of emulation of modern devices and operating systems. **It is not for enabling
-illegal activity**. All information is obtained via reverse engineering of
-legally purchased devices and games and information made public on the internet
-(you'd be surprised what's indexed on Google...).
+The goal of this project is to experiment, research, and educate on the topic of
+emulation. **It is not for enabling illegal activity.** You must own a legal copy
+of any game you run. No game files, keys, or copyrighted material are distributed
+with this build.
