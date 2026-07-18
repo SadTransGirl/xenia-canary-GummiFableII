@@ -101,6 +101,11 @@ They're enabled by default (`apply_patches = true` in the config). Keep the
   which can be game-version specific. Enable `log_resolve_readback` in the config
   to find your version's address range, then set `readback_resolve_only_dest_bases`
   accordingly. Details in [CHANGES.md](CHANGES.md#fable-ii-fixes).
+- **Flickering on the ground / surfaces** — make sure
+  `readback_resolve_drain_on_fence = true` in your config. It's `true` in all of
+  these presets by default. Setting it `false` trades a little more performance
+  for the risk of stale resolved data, which shows up as surface flicker in
+  Fable II — leave it `true` unless you know you need the extra speed.
 - **Stutter / low FPS at 2×** — try the `x1-fsr` preset (native render, upscaled).
 
 ---
