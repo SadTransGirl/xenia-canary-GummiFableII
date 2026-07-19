@@ -49,28 +49,62 @@ A full, setting-by-setting explanation of every change is in
 
 ---
 
-## Getting it running
+## Setup
+
+### Step 1 — Download & extract
 
 1. Download the release `.zip` from the
-   [Releases](https://github.com/SadTransGirl/xenia-canary-GummiFableII/releases)
-   page.
-2. Extract it to a folder of its own (e.g. `C:\Games\XeniaFableII\`). You should
-   have:
-   - `xenia_canary.exe`
-   - `xenia-canary.config.toml`  ← the active config (2x + CAS by default)
-   - `xenia-canary.x1-fsr.config.toml`  ← alternate preset (native + FSR)
-   - `patches\`  ← Fable II patches, already in place
-3. Run **`xenia_canary.exe`** and open your Fable II dump
-   (**File → Open**, or drag the game onto the window).
+   [Releases](https://github.com/SadTransGirl/xenia-canary-GummiFableII/releases) page.
+2. **Extract it into its own empty folder** (e.g. `C:\Games\XeniaFableII\`) — don't
+   run it from inside the zip, and don't drop it in `Downloads` next to other files.
 
-That's it — the included config and patches are picked up automatically.
+After extracting you should see:
 
+```
+XeniaFableII\
+├─ xenia_canary.exe              ← the emulator
+├─ xenia-canary.config.toml      ← active config (2× + CAS — used by default)
+├─ xenia-canary.x1-fsr.config.toml   ← alternate preset (native 720p + FSR)
+├─ patches\                      ← Fable II patches (already set up)
+└─ low-end-cpu\                  ← fallback configs for weaker CPUs
+```
 
-## Choosing a config preset
+### Step 2 — Launch and load your game
 
-Presets live in [`configs/`](configs/). **To switch presets, copy the one you
-want next to `xenia_canary.exe` and rename it to `xenia-canary.config.toml`**
-(replace the existing one). Xenia loads that file on startup.
+1. Run **`xenia_canary.exe`**.
+2. **File → Open** your Fable II dump (or drag the game file onto the window).
+
+That's the whole setup — the config and patches load automatically. You do **not**
+need to configure anything for a normal playthrough.
+
+> **A brief pause the first time you enter an area is normal** — that's shaders
+> compiling. On the default config it's a quick hitch/pause; on the `low-end-cpu`
+> configs it's a brief flicker instead. Either way it clears within a moment and won't
+> happen in that spot again. If the hitching is too much on a weaker CPU, see
+> [Which config should I use?](#which-config-should-i-use) below.
+
+### Which config should I use?
+
+The default (`xenia-canary.config.toml`) is right for most people. Only swap if one of
+these fits you better:
+
+| Your situation | Use | 
+|---|---|
+| **Most PCs** — just want it to work | Keep the default (2× + CAS) |
+| **Weaker/older GPU**, or slowdown in crowds | `xenia-canary.x1-fsr.config.toml` (native 720p + FSR) |
+| **Weaker CPU** — the game hitches/stutters | a config from `low-end-cpu\` (see its README) |
+
+**How to swap a config:** copy the one you want next to `xenia_canary.exe`, delete the
+old `xenia-canary.config.toml`, and **rename your chosen file to
+`xenia-canary.config.toml`**. Xenia loads that file on startup. (Advanced: you can also
+launch with `xenia_canary.exe --config "some-other.config.toml"` to test without
+renaming.)
+
+---
+
+## Config presets (reference)
+
+All presets live in [`configs/`](configs/). Full table:
 
 | Preset | Render resolution | Sharpening | Best for |
 |---|---|---|---|
