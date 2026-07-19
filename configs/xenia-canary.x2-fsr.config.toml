@@ -335,7 +335,7 @@ render_target_path_vulkan = ""                    	# Render target emulation pat
                                                   	#  Any other value:
                                                   	#   Choose what is considered the most optimal for the system (currently always FB because the FSI path is much slower now).
 
-resolve_check_number_format = false               	# Require the destination number format to match before using fast color resolves.
+resolve_check_number_format = true                	# Require the destination number format to match before using fast color resolves.
                                                   	# Fast resolves copy the exact EDRAM bits. If a title resolves unsigned color data to a signed or integer destination, enabling this forces full resolves in the shader so the destination gets repacked instead.
                                                   	# This can fix some garbage shading stemming from format mismatches, but it's disabled by default because it can worsen performance in some games that realistically don't need it.
 
