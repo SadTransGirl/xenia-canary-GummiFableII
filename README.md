@@ -9,7 +9,7 @@ the game patches already set up.
 > [Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki) still
 > applies.
 
-Discord For Help/Support:
+Discord For Help/Support: https://discord.gg/3zE3Ey2TH7
 
 ---
 ### Gummi's Disclaimer:
