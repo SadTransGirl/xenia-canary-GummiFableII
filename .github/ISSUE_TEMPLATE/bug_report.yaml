@@ -1,55 +1,93 @@
 name: Bug report
-description: Template for bug reports.
-labels: bug
+description: Report a problem with the GummiFableII Fable II build
+labels: ["bug"]
 body:
-  - id: disclaimer
-    type: markdown
+  - type: markdown
     attributes:
       value: |
-        Try to create a very concise title that's straight to the point.
+        Thanks for reporting! **Before you file, please:**
+        - 🔎 Search [existing issues](https://github.com/SadTransGirl/xenia-canary-GummiFableII/issues?q=is%3Aissue) — it may already be reported.
+        - 📖 Check the [README Setup + Troubleshooting](https://github.com/SadTransGirl/xenia-canary-GummiFableII#troubleshooting) — flicker, hitching, crowd slowdown, and dog issues are covered there.
 
-        **THIS IS NOT A SUPPORT FORUM!** For support, first read the wiki: https://github.com/xenia-canary/xenia-canary/wiki
-        If your question wasn't answered there or you need help, proceed to #help in the Discord server: https://discord.gg/Q9mxZf9
-
-        DO NOT CREATE ISSUES ABOUT SPECIFIC GAMES IN THIS REPOSITORY!
-        A game specific issue would be e.g. "Game X crashes after you hit a character a certain way"
-        A Xenia issue would be e.g. "Kernel export NtDoSomething does nothing"
-        For specific games, visit https://github.com/xenia-canary/game-compatibility#game-compatibility
-  - id: validation
-    type: checkboxes
+        This build is **Fable II–specific**, so Fable II bugs are welcome here.
+  - type: checkboxes
+    id: checks
     attributes:
-      label: Validation
+      label: Before filing
       options:
-      - label: I've read the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ).
-        required: true
-      - label: The Xenia build used is from a Canary branch. (not UWP/MLBS/AlexVS/master/pull requests, etc)
-        required: true
-      - label: This issue isn't for tech support (help with Xenia).
-        required: true
-      - label: If this issue occurs in a specific game, I've done analysis to locate the faulty subsystem of the emulator and a potential reason in it.
-        required: true
-      - label: I've checked if this issue hasn't already been reported.
-        required: true
-      - label: 'My device meets the minimum requirements: https://github.com/xenia-canary/xenia-canary/wiki/Quickstart#system-requirements'
-        required: true
-      - label: '(If building) I have read the building doc: https://github.com/xenia-canary/xenia-canary/blob/master/docs/building.md'
-  - id: problem
-    type: textarea
+        - label: I've searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I've read the README Setup + Troubleshooting.
+          required: true
+        - label: I'm using my own legally-owned copy of Fable II. (No piracy — do not ask for game files.)
+          required: true
+  - type: dropdown
+    id: config
     attributes:
-      label: Describe what's going wrong
+      label: Which config are you using?
+      options:
+        - Default (2× + CAS)
+        - x1-fsr (native 720p + FSR)
+        - low-end-cpu (any variant)
+        - Custom / modified
     validations:
       required: true
-  - id: what-should-happen
-    type: textarea
+  - type: input
+    id: game-version
     attributes:
-      label: Describe what should happen
+      label: Game version
+      placeholder: e.g. GOTY (no TU1)
     validations:
       required: true
-  - id: callstack
-    type: textarea
+  - type: textarea
+    id: problem
     attributes:
-      label: If applicable, provide a callstack here, especially for crashes
-  - id: logfile
-    type: textarea
+      label: What's going wrong?
+      description: One or two sentences. Where and when does it happen (specific area/action, or "always")?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
     attributes:
-      label: If applicable, upload a logfile and link it here
+      label: What should happen instead?
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Windows 11
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: e.g. Ryzen 5 5600
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: e.g. RTX 3060
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM
+      placeholder: e.g. 16 GB
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you already tried?
+      description: e.g. switched configs, deleted cache_host, verified the game dump…
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshot / clip
+      description: Drag an image or video in here if the issue is visual.
+  - type: textarea
+    id: logfile
+    attributes:
+      label: Log file
+      description: If it's a crash/freeze, attach `xenia.log` from next to the exe.

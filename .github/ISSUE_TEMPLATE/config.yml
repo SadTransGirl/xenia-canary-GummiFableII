@@ -1,4 +1,8 @@
+blank_issues_enabled: false
 contact_links:
-  - name: Xenia Discord server
-    url: https://discord.gg/Q9mxZf9
-    about: Tech support for Xenia belongs here.
+  - name: 📖 README — Setup & Troubleshooting
+    url: https://github.com/SadTransGirl/xenia-canary-GummiFableII#troubleshooting
+    about: Most flicker/hitching/crowd/dog issues are already answered here — check first.
+  - name: 💬 Discord — Ask for help
+    url: https://discord.gg/YOUR-INVITE
+    about: Setup help and general chat. (Replace this URL with your real invite.)
