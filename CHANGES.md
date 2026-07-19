@@ -52,6 +52,7 @@ All settings live in `xenia-canary.config.toml`.
 | `guard_indirect_call_targets = true` | Turns a **combat hard-crash** (call through a bad function pointer) into a safely-skipped call. |
 | `deadlock_event_watchdog = true` | Recovers from a **worker-pool freeze** (a lost event wakeup) instead of a permanent softlock. |
 | `cpu_starvation_mitigation = true` | Keeps the game's logic thread alive when the host CPU is busy — fixes **NPCs/characters freezing** while the world keeps running. |
+| `d3d12_pipeline_creation_threads = 0` | Synchronous shader compilation — fixes **vegetation blowout, the "red dog", and first-launch flicker** in one setting. In async mode Xenia skips draws whose shader is still compiling, briefly revealing the raw render buffer; compiling synchronously waits instead, so every frame is correct. Cost is a brief compile hitch on weaker CPUs (see low-end configs below). Makes the older `gamma_decode_pwl_resolve` / `resolve_check_number_format` workarounds unnecessary — both are back at their defaults. |
 
 ## Config presets
 
@@ -60,8 +61,17 @@ Ready-made configs are in [`configs/`](configs/). To use one, copy it over
 
 | Preset | Resolution | Sharpening | Best for |
 |---|---|---|---|
-| `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display. |
+| `xenia-canary.x1-fsr.config.toml` | Native (720p) | FSR | Native render upscaled to your display; lighter GPU load (crowds). |
 | `xenia-canary.x2-cas.config.toml` | 2x | CAS | **Recommended** — sharp 2x with low overhead. |
 
 All presets share the same performance settings and fixes above — only the
 render scale and sharpener differ.
+
+### Low-end CPUs — [`configs/low-end-cpu/`](configs/low-end-cpu/)
+
+Same four presets, but with **async** shader compilation
+(`d3d12_pipeline_creation_threads = -1`) so there's no compile hitch. The trade-off is
+the cold-cache flicker/blowout returns, so these re-enable the mitigations
+(`gamma_decode_pwl_resolve = false`, `resolve_check_number_format = true`) to keep it to
+a minimum. The flicker still tapers off as the shader cache warms. Use these only if the
+synchronous-compile hitch on the main presets bothers you.

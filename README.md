@@ -81,6 +81,24 @@ Both presets share the same performance settings and fixes — only the render
 scale and the sharpener differ. The default `xenia-canary.config.toml` in the
 release is the x2-cas preset.
 
+### Shader compilation (why these presets look clean)
+
+These presets compile shaders **synchronously** (`d3d12_pipeline_creation_threads = 0`).
+That's the single setting that fixes the cold-cache artifacts Fable II is prone to —
+vegetation blowout, the "red dog", and first-launch flicker. In the default (async)
+mode Xenia *skips* draws whose shader is still compiling, which briefly reveals the
+raw render buffer (that's the flicker/blowout). Synchronous compile waits instead, so
+every frame is correct. On a capable CPU the wait is invisible.
+
+### Low-end CPUs
+
+Synchronous compile can cause a brief **hitch/stutter** the first time a new shader
+appears, which is more noticeable on weaker CPUs. If that bothers you, use the configs
+in [`configs/low-end-cpu/`](configs/low-end-cpu/) — same presets, but with async shader
+compilation (no hitching) plus the gamma/number-format workarounds re-enabled to keep
+the async flicker to a minimum. Swap one in the same way (copy over
+`xenia-canary.config.toml`). The flicker still tapers off as your shader cache warms up.
+
 ---
 
 ## Patches
@@ -107,6 +125,12 @@ They're enabled by default (`apply_patches = true` in the config). Keep the
   for the risk of stale resolved data, which shows up as surface flicker in
   Fable II — leave it `true` unless you know you need the extra speed.
 - **Stutter / low FPS at 2×** — try the `x1-fsr` preset (native render, upscaled).
+- **Hitching when new things appear (weaker CPUs)** — that's synchronous shader
+  compilation. Switch to a [`configs/low-end-cpu/`](configs/low-end-cpu/) preset (async).
+- **Brief flicker/blowout on first entering an area (async / low-end presets only)** —
+  cold shader cache; it clears as those shaders compile and won't happen there again.
+- **Slowdown with lots of NPCs on screen** — usually GPU-bound at 2×. Drop to the
+  `x1-fsr` preset (native render) for a large GPU saving in crowd scenes.
 
 ---
 
