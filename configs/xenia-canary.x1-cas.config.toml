@@ -96,7 +96,7 @@ d3d12_break_on_warning = false                    	# Break on Direct3D 12 valida
 d3d12_debug = false                               	# Enable Direct3D 12 and DXGI debug layer.
 d3d12_dxbc_disasm = false                         	# Disassemble DXBC shaders after generation.
 d3d12_dxbc_disasm_dxilconv = false                	# Disassemble DXBC shaders after conversion to DXIL, if DXIL shaders are supported by the OS, and DirectX Shader Compiler DLLs available at https://github.com/microsoft/DirectXShaderCompiler/releases are present.
-d3d12_pipeline_creation_threads = -1              	# Number of threads used for graphics pipeline creation. -1 to calculate automatically (75% of logical CPU cores), a positive number to specify the number of threads explicitly (up to the number of logical CPU cores), 0 to disable multithreaded pipeline creation.
+d3d12_pipeline_creation_threads = 0              	# Number of threads used for graphics pipeline creation. -1 to calculate automatically (75% of logical CPU cores), a positive number to specify the number of threads explicitly (up to the number of logical CPU cores), 0 to disable multithreaded pipeline creation.
 d3d12_queue_priority = 1                          	# Graphics (direct) command queue scheduling priority, 0 - normal, 1 - high, 2 - global realtime (requires administrator privileges, may impact system responsibility)
 d3d12_submit_on_primary_buffer_end = true         	# Submit the command list when a PM4 primary buffer ends if it's possible to submit immediately to try to reduce frame latency.
 d3d12_tessellation_wireframe = false              	# Display tessellated surfaces as wireframe for debugging.
@@ -222,7 +222,7 @@ force_convert_triangle_fans_to_lists = false      	# For host graphics API downl
 framerate_limit = 165                             	# Maximum frames per second. 0 = Unlimited frames.
                                                   	# Defaults to 60, when set to 0, and VSYNC is enabled.
 
-gamma_decode_pwl_resolve = false                  	# During 8_8_8_8_GAMMA MSAA color resolves, average the samples in linear space instead of averaging the encoded PWL gamma values directly.
+gamma_decode_pwl_resolve = true                   	# During 8_8_8_8_GAMMA MSAA color resolves, average the samples in linear space instead of averaging the encoded PWL gamma values directly.
                                                   	# This is separate from gamma_render_target_as_unorm16. It only applies when a full shader resolve reads an 8_8_8_8_GAMMA EDRAM color source. Compatible 8_8_8_8 destinations are written back as PWL gamma.
                                                   	# Leave enabled for games that otherwise look overexposed after gamma MSAA resolves. Disable only if it causes a title-specific regression.
 
@@ -335,7 +335,7 @@ render_target_path_vulkan = ""                    	# Render target emulation pat
                                                   	#  Any other value:
                                                   	#   Choose what is considered the most optimal for the system (currently always FB because the FSI path is much slower now).
 
-resolve_check_number_format = true                	# Require the destination number format to match before using fast color resolves.
+resolve_check_number_format = false               	# Require the destination number format to match before using fast color resolves.
                                                   	# Fast resolves copy the exact EDRAM bits. If a title resolves unsigned color data to a signed or integer destination, enabling this forces full resolves in the shader so the destination gets repacked instead.
                                                   	# This can fix some garbage shading stemming from format mismatches, but it's disabled by default because it can worsen performance in some games that realistically don't need it.
 
