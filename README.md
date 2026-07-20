@@ -10,9 +10,12 @@ the game patches already set up.
 > applies.
 
 Discord For Help/Support: https://discord.gg/3zE3Ey2TH7
+### There seems to be some confusion about this build, I made this for pure testing purposes. This so we have something more stable to test with while work happens on the recomp. THIS ISN'T A REPLACEMENT IN ANYWAY. -Gummi.
 
+### VVV Please read my disclaimer below. Thank you. VVV
 ---
 ### Gummi's Disclaimer:
+
 
 ## This was a pure passion project, Something for my mental health more than anything.
 
